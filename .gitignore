@@ -1,0 +1,10 @@
+# Build output
+/target/
+
+# Never commit identities, keys or debug traces (they contain secrets/plaintext)
+*.enc
+*.log
+.p2pchat/
+.symbolon/
+*.key
+*.pem

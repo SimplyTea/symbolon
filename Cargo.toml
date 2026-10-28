@@ -1,0 +1,34 @@
+[package]
+name = "symbolon"
+description = "Serverless, pinned-key, forward-secret peer-to-peer messaging with signed group governance"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# --- Long-term identity signatures (Ed25519) ---
+# --- Ephemeral Diffie-Hellman key exchange (X25519) ---
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# --- Authenticated encryption for every message on the wire ---
+chacha20poly1305 = "0.10"
+# --- Key derivation (turns the raw DH shared secret into separate traffic keys) ---
+hkdf = "0.12"
+# --- Hashing, used for the handshake transcript hash ---
+sha2 = "0.10"
+# --- Cryptographically secure randomness source ---
+rand_core = { version = "0.6", features = ["getrandom"] }
+# --- Password-based key derivation, for encrypting identity keys at rest ---
+# --- Password-based key derivation, for encrypting identity keys at rest ---
+pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"] }
+
+# --- Pinned transitive dependencies ---
+# Newer releases of these crates require the "edition2024" Cargo feature,
+# which isn't available on every stable toolchain. Pinning them keeps the
+# build reproducible on older-but-widely-deployed compilers.
+rpassword = "=7.3.1"
+base64ct = "=1.6.0"
+zeroize = "=1.7.0"
+zeroize_derive = "=1.4.2"
+ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
+
