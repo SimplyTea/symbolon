@@ -7,13 +7,13 @@
 //! Everything measured here is *CPU cost on one machine*. Network latency is
 //! deliberately excluded: add it in the simulator as a separate parameter.
 
+use std::net::{TcpListener, TcpStream};
+use std::time::Instant;
 use symbolon::identity::Identity;
 use symbolon::peer::PeerRegistry;
 use symbolon::persistence::EncryptedIdentity;
 use symbolon::ratchet::Ratchet;
 use symbolon::session::{Role, Session};
-use std::net::{TcpListener, TcpStream};
-use std::time::Instant;
 
 /// Run `f` `runs` times and print median and 95th percentile in microseconds.
 fn measure(name: &str, param: &str, runs: usize, mut f: impl FnMut()) {
@@ -83,14 +83,19 @@ fn main() {
 
     // --- Ratchet: worst-case out-of-order jump (hash-chain catch-up) ---
     for gap in [10u32, 100, 1000] {
-        measure("ratchet_decrypt_after_gap", &format!("gap{gap}"), 50, || {
-            let (mut a, mut b) = pair();
-            for _ in 0..gap {
-                a.encrypt(b"x").unwrap();
-            }
-            let w = a.encrypt(b"y").unwrap();
-            b.decrypt(&w).unwrap();
-        });
+        measure(
+            "ratchet_decrypt_after_gap",
+            &format!("gap{gap}"),
+            50,
+            || {
+                let (mut a, mut b) = pair();
+                for _ in 0..gap {
+                    a.encrypt(b"x").unwrap();
+                }
+                let w = a.encrypt(b"y").unwrap();
+                b.decrypt(&w).unwrap();
+            },
+        );
     }
 
     // --- Session: full mutual-auth handshake over loopback TCP ---
@@ -132,22 +137,48 @@ fn main() {
         let b = h.join().unwrap();
         for size in [64usize, 1024, 64 * 1024] {
             let payload = vec![2u8; size];
-            measure("session_send_recv_loopback", &format!("{size}B"), 300, || {
-                a.send(&payload).unwrap();
-                std::hint::black_box(b.recv().unwrap());
-            });
+            measure(
+                "session_send_recv_loopback",
+                &format!("{size}B"),
+                300,
+                || {
+                    a.send(&payload).unwrap();
+                    std::hint::black_box(b.recv().unwrap());
+                },
+            );
         }
     }
 
-    // --- Persistence: identity unlock (PBKDF2, 600k rounds by default) ---
+    // --- Persistence: identity unlock (Argon2id; run on the target device to tune) ---
     {
+        use symbolon::persistence::KdfParams;
         let dir = std::env::temp_dir().join(format!("bench-id-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("id.enc");
-        EncryptedIdentity::save(&id, &path, "bench passphrase").unwrap();
-        measure("identity_unlock_pbkdf2", "600k", 5, || {
-            std::hint::black_box(EncryptedIdentity::load(&path, "bench passphrase").unwrap());
-        });
+        for (label, params) in [
+            (
+                "19MiB_t2",
+                KdfParams {
+                    memory_kib: 19 * 1024,
+                    time_cost: 2,
+                    lanes: 1,
+                },
+            ),
+            ("64MiB_t3_default", KdfParams::default()),
+            (
+                "128MiB_t3",
+                KdfParams {
+                    memory_kib: 128 * 1024,
+                    time_cost: 3,
+                    lanes: 1,
+                },
+            ),
+        ] {
+            EncryptedIdentity::save_with_params(&id, &path, "bench passphrase", params).unwrap();
+            measure("identity_unlock_argon2id", label, 3, || {
+                std::hint::black_box(EncryptedIdentity::load(&path, "bench passphrase").unwrap());
+            });
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

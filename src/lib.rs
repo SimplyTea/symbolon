@@ -33,6 +33,10 @@
 //! - [`ratchet`]: Double Ratchet - per-message forward secrecy and
 //!   post-compromise healing inside the transport encryption.
 //! - [`reliability`]: sequence numbering, acknowledgement, gap detection.
+//! - [`storage`]: pluggable storage traits (event log, key custody, state
+//!   blobs) with file and in-memory defaults.
+//! - [`transport`]: pluggable byte-stream transport (TCP by default, in-memory
+//!   for tests and simulation) - how peers are found/connected is the app's job.
 //! - [`session`]: ties everything together into a usable send/recv API.
 //! - [`group`]: group chat as a signed, hash-chained full-mesh of
 //!   [`session::Session`]s - see that module's docs for the design
@@ -43,7 +47,9 @@
 //! See `tests/` for end-to-end examples, including simulated disconnects,
 //! reordering, and active tampering.
 
+pub mod clock;
 pub mod crypto;
+pub mod discovery;
 pub mod error;
 pub mod framing;
 pub mod group;
@@ -55,7 +61,12 @@ pub mod persistence;
 pub mod ratchet;
 pub mod reliability;
 pub mod session;
+pub mod sessionstate;
+pub mod storage;
+pub mod trace;
+pub mod transport;
+pub mod truststore;
 
 pub use error::{ChatError, Result};
 pub use identity::{Identity, PeerRegistry};
-pub use session::{Role, Session};
+pub use session::{Reconnected, Role, Session};

@@ -47,6 +47,28 @@ pub enum ChatError {
 
     /// The protocol / handshake version the peer sent isn't one we support.
     UnsupportedVersion,
+    /// The peer's build speaks a different major.minor (only the patch may
+    /// differ). Carries both versions so the cause is obvious.
+    VersionMismatch {
+        ours: crate::handshake::Version,
+        theirs: crate::handshake::Version,
+    },
+
+    /// A reconnect handshake authenticated a DIFFERENT peer than the one
+    /// this session belongs to. The ratchet and outbox are specific to one
+    /// peer, so the connection is refused.
+    PeerMismatch,
+
+    /// The peer reconnected with a different SESSION EPOCH: it has started
+    /// a brand-new session (typically because its app restarted and lost the
+    /// ratchet/outbox state), so this session can no longer be resumed. Use
+    /// [`crate::session::Session::reconnect_or_replace`] to be handed a fresh
+    /// session automatically.
+    PeerRestarted,
+    /// A newer session for the same peer took over this one's saved state,
+    /// so this (older) session may no longer send: two sessions writing one
+    /// state slot would reuse encryption keys. Use the newer session.
+    SessionSuperseded,
     /// The handshake didn't complete within the configured timeout - either
     /// the peer is unreachable, unresponsive, or deliberately stalling
     /// (e.g. a slowloris-style resource-exhaustion attempt).
@@ -84,28 +106,65 @@ impl fmt::Display for ChatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ChatError::DecryptionFailed => {
-                write!(f, "authenticated decryption failed (corrupt or tampered message)")
+                write!(
+                    f,
+                    "authenticated decryption failed (corrupt or tampered message)"
+                )
             }
             ChatError::HandshakeAuthenticationFailed => {
-                write!(f, "peer failed to prove ownership of their pinned identity key")
+                write!(
+                    f,
+                    "peer failed to prove ownership of their pinned identity key"
+                )
             }
             ChatError::UnknownPeer => write!(f, "peer identity key is not in our trusted registry"),
             ChatError::InvalidPublicKey => write!(f, "peer sent an invalid public key"),
-            ChatError::FrameTooLarge => write!(f, "incoming frame exceeds the maximum allowed size"),
+            ChatError::FrameTooLarge => {
+                write!(f, "incoming frame exceeds the maximum allowed size")
+            }
             ChatError::ConnectionClosed => write!(f, "connection closed unexpectedly"),
             ChatError::Io(e) => write!(f, "I/O error: {e}"),
             ChatError::MalformedMessage(reason) => write!(f, "malformed message: {reason}"),
             ChatError::UnsupportedVersion => write!(f, "unsupported protocol version"),
-            ChatError::HandshakeTimedOut => write!(f, "handshake did not complete within the configured timeout"),
-            ChatError::PermissionDenied => write!(f, "acting member's current tier does not grant the required permission"),
+            ChatError::VersionMismatch { ours, theirs } => write!(
+                f,
+                "version mismatch: this build is {ours}, the peer is {theirs} (major.minor must match; patch may differ)"
+            ),
+            ChatError::PeerMismatch => write!(
+                f,
+                "reconnected to a different peer than this session belongs to"
+            ),
+            ChatError::PeerRestarted => write!(
+                f,
+                "peer restarted and lost its session state; a fresh session is required"
+            ),
+            ChatError::SessionSuperseded => write!(
+                f,
+                "a newer session for this peer took over the saved state; use that one"
+            ),
+            ChatError::HandshakeTimedOut => write!(
+                f,
+                "handshake did not complete within the configured timeout"
+            ),
+            ChatError::PermissionDenied => write!(
+                f,
+                "acting member's current tier does not grant the required permission"
+            ),
             ChatError::UnauthorizedRosterOp => {
-                write!(f, "roster operation was proposed by someone who is not a current group member")
+                write!(
+                    f,
+                    "roster operation was proposed by someone who is not a current group member"
+                )
             }
             ChatError::RosterHistoryMismatch => {
                 write!(f, "roster operation does not build on our current roster history (stale or forked)")
             }
-            ChatError::RosterSignatureInvalid => write!(f, "roster operation signature did not verify"),
-            ChatError::SenderNotAMember => write!(f, "message sender is not a current member of the group"),
+            ChatError::RosterSignatureInvalid => {
+                write!(f, "roster operation signature did not verify")
+            }
+            ChatError::SenderNotAMember => {
+                write!(f, "message sender is not a current member of the group")
+            }
             ChatError::Ratchet(why) => write!(f, "ratchet rejected message: {why}"),
             ChatError::SenderChainBroken => {
                 write!(f, "sender's message hash chain is broken (reordering, corruption, or equivocation)")

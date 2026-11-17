@@ -5,12 +5,12 @@
 //! - confidentiality/integrity (tamper detection),
 //! - no missing messages across a disconnect + reconnect, still in order.
 
-use symbolon::identity::Identity;
-use symbolon::peer::PeerRegistry;
-use symbolon::session::{Role, Session};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
+use symbolon::identity::Identity;
+use symbolon::peer::PeerRegistry;
+use symbolon::session::{Role, Session};
 
 /// Spin up a listener on an OS-assigned free port and return it plus the
 /// address to connect to.
@@ -50,7 +50,8 @@ fn handshake_succeeds_and_both_sides_learn_the_correct_peer_fingerprint() {
 
     let client_stream = TcpStream::connect(addr).expect("connect");
     let client_session =
-        Session::establish(client_stream, Role::Initiator, &alice, &alice_registry).expect("alice handshake");
+        Session::establish(client_stream, Role::Initiator, &alice, &alice_registry)
+            .expect("alice handshake");
 
     let server_session = server.join().expect("server thread");
 
@@ -80,12 +81,19 @@ fn rejects_handshake_from_a_peer_whose_key_is_not_pinned() {
     });
 
     let client_stream = TcpStream::connect(addr).expect("connect");
-    let client_result = Session::establish(client_stream, Role::Initiator, &mallory, &mallory_registry);
+    let client_result =
+        Session::establish(client_stream, Role::Initiator, &mallory, &mallory_registry);
 
     let server_result = server.join().expect("server thread");
 
-    assert!(client_result.is_err(), "Mallory's handshake should be refused");
-    assert!(server_result.is_err(), "Bob must refuse an untrusted identity");
+    assert!(
+        client_result.is_err(),
+        "Mallory's handshake should be refused"
+    );
+    assert!(
+        server_result.is_err(),
+        "Bob must refuse an untrusted identity"
+    );
 }
 
 #[test]
@@ -99,15 +107,19 @@ fn messages_are_delivered_in_order_both_directions() {
     });
 
     let client_stream = TcpStream::connect(addr).expect("connect");
-    let alice_session =
-        Session::establish(client_stream, Role::Initiator, &alice, &alice_registry).expect("alice handshake");
+    let alice_session = Session::establish(client_stream, Role::Initiator, &alice, &alice_registry)
+        .expect("alice handshake");
     let bob_session = server.join().expect("server thread");
 
     for i in 0..5u32 {
-        alice_session.send(format!("alice says {i}").as_bytes()).unwrap();
+        alice_session
+            .send(format!("alice says {i}").as_bytes())
+            .unwrap();
     }
     for i in 0..5u32 {
-        bob_session.send(format!("bob says {i}").as_bytes()).unwrap();
+        bob_session
+            .send(format!("bob says {i}").as_bytes())
+            .unwrap();
     }
 
     for i in 0..5u32 {
@@ -146,7 +158,8 @@ fn no_message_is_lost_across_a_disconnect_and_reconnect() {
     // --- First connection ---
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        let session = Session::establish(stream, Role::Responder, &bob, &bob_registry).expect("bob handshake");
+        let session = Session::establish(stream, Role::Responder, &bob, &bob_registry)
+            .expect("bob handshake");
         // Hand back everything the test still needs after the handshake:
         // the live session, and the identity/registry so we can reconnect
         // later (both are needed again and neither is `Clone`, by design -
@@ -158,8 +171,8 @@ fn no_message_is_lost_across_a_disconnect_and_reconnect() {
     // Keep a raw handle so the test can forcibly sever the connection,
     // independent of whatever Session does with its own clone of the fd.
     let killable_client_stream = client_stream.try_clone().expect("clone");
-    let alice_session =
-        Session::establish(client_stream, Role::Initiator, &alice, &alice_registry).expect("alice handshake");
+    let alice_session = Session::establish(client_stream, Role::Initiator, &alice, &alice_registry)
+        .expect("alice handshake");
     let (bob_session, bob, bob_registry) = server.join().expect("server thread");
 
     // Message 1 goes through normally.
@@ -171,7 +184,10 @@ fn no_message_is_lost_across_a_disconnect_and_reconnect() {
     // the next step deals only with "message two", not a race against
     // "message one"'s own ack.
     assert!(
-        wait_until(|| alice_session.pending_unacked() == 0, Duration::from_secs(2)),
+        wait_until(
+            || alice_session.pending_unacked() == 0,
+            Duration::from_secs(2)
+        ),
         "ack for message one never arrived"
     );
 
@@ -184,7 +200,11 @@ fn no_message_is_lost_across_a_disconnect_and_reconnect() {
     // This still stages the message in Alice's outbox even though the
     // write to the now-dead socket fails.
     let _ = alice_session.send(b"message two");
-    assert_eq!(alice_session.pending_unacked(), 1, "message two must still be pending");
+    assert_eq!(
+        alice_session.pending_unacked(),
+        1,
+        "message two must still be pending"
+    );
 
     // --- Bob comes back online: rebind a fresh listener/connection pair ---
     let (listener2, addr2) = bind_listener();
@@ -227,8 +247,8 @@ fn negotiated_protocol_version_is_reported_on_both_sides() {
         Session::establish(stream, Role::Responder, &bob, &bob_registry).expect("bob handshake")
     });
     let client_stream = TcpStream::connect(addr).expect("connect");
-    let alice_session =
-        Session::establish(client_stream, Role::Initiator, &alice, &alice_registry).expect("alice handshake");
+    let alice_session = Session::establish(client_stream, Role::Initiator, &alice, &alice_registry)
+        .expect("alice handshake");
     let bob_session = server.join().expect("server thread");
 
     use symbolon::handshake::PROTOCOL_VERSION_CURRENT;
@@ -273,11 +293,21 @@ fn handshake_progress_callback_reports_every_step_in_order() {
     // their signature checking out, and finally full completion - each
     // step strictly more "verified" than the last.
     assert!(matches!(events[0], HandshakeProgress::Started));
-    assert!(matches!(events[1], HandshakeProgress::VersionNegotiated(1)));
-    assert!(matches!(&events[2], HandshakeProgress::PeerIdentityClaimed(id) if *id == bob_fingerprint));
-    assert!(matches!(&events[3], HandshakeProgress::PeerIdentityTrusted(id) if *id == bob_fingerprint));
-    assert!(matches!(&events[4], HandshakeProgress::PeerSignatureVerified(id) if *id == bob_fingerprint));
-    assert!(matches!(&events[5], HandshakeProgress::Completed { peer_id, negotiated_version: 1 } if *peer_id == bob_fingerprint));
+    assert!(
+        matches!(events[1], HandshakeProgress::VersionNegotiated(v) if v == symbolon::handshake::PROTOCOL_VERSION_CURRENT)
+    );
+    assert!(
+        matches!(&events[2], HandshakeProgress::PeerIdentityClaimed(id) if *id == bob_fingerprint)
+    );
+    assert!(
+        matches!(&events[3], HandshakeProgress::PeerIdentityTrusted(id) if *id == bob_fingerprint)
+    );
+    assert!(
+        matches!(&events[4], HandshakeProgress::PeerSignatureVerified(id) if *id == bob_fingerprint)
+    );
+    assert!(
+        matches!(&events[5], HandshakeProgress::Completed { peer_id, negotiated_version } if *peer_id == bob_fingerprint && *negotiated_version == symbolon::handshake::PROTOCOL_VERSION_CURRENT)
+    );
 }
 
 #[test]
@@ -301,9 +331,19 @@ fn handshake_times_out_against_an_unresponsive_peer_instead_of_hanging_forever()
     });
 
     let client_stream = TcpStream::connect(addr).expect("connect");
-    let config = SessionConfig { handshake_timeout: Some(Duration::from_millis(200)) };
+    let config = SessionConfig {
+        handshake_timeout: Some(Duration::from_millis(200)),
+        ..SessionConfig::default()
+    };
     let start = std::time::Instant::now();
-    let result = Session::establish_with(client_stream, Role::Initiator, &alice, &alice_registry, config, None);
+    let result = Session::establish_with(
+        client_stream,
+        Role::Initiator,
+        &alice,
+        &alice_registry,
+        config,
+        None,
+    );
     let elapsed = start.elapsed();
 
     match result {
@@ -329,7 +369,10 @@ fn tampered_ciphertext_is_rejected_not_silently_accepted() {
     tampered[0] ^= 0x01;
 
     // The legitimate ciphertext decrypts fine...
-    assert_eq!(decrypt(&key, Channel::Data, 1, b"", &ciphertext).unwrap(), b"transfer $10");
+    assert_eq!(
+        decrypt(&key, Channel::Data, 1, b"", &ciphertext).unwrap(),
+        b"transfer $10"
+    );
     // ...but any bit-flip anywhere is caught, never silently "decrypted"
     // into corrupted-but-accepted plaintext.
     assert!(decrypt(&key, Channel::Data, 1, b"", &tampered).is_err());
@@ -344,7 +387,8 @@ fn connected_pair() -> (Session, Session) {
         Session::establish(stream, Role::Responder, &bob, &bob_registry).expect("bob handshake")
     });
     let client = TcpStream::connect(addr).expect("connect");
-    let a = Session::establish(client, Role::Initiator, &alice, &alice_registry).expect("alice handshake");
+    let a = Session::establish(client, Role::Initiator, &alice, &alice_registry)
+        .expect("alice handshake");
     (a, server.join().expect("server thread"))
 }
 
@@ -365,7 +409,11 @@ fn the_responder_can_send_before_it_has_received_anything() {
 fn a_long_two_way_conversation_keeps_every_ratchet_turn_in_sync_over_tcp() {
     let (alice, bob) = connected_pair();
     for i in 0..200u32 {
-        let (tx, rx) = if i % 3 == 0 { (&bob, &alice) } else { (&alice, &bob) };
+        let (tx, rx) = if i % 3 == 0 {
+            (&bob, &alice)
+        } else {
+            (&alice, &bob)
+        };
         let msg = format!("message {i}");
         tx.send(msg.as_bytes()).unwrap();
         assert_eq!(rx.recv().unwrap(), msg.as_bytes());

@@ -90,13 +90,13 @@ pub const HEADER_LEN: usize = 40;
 /// Poly1305 tag length appended by the AEAD.
 const TAG_LEN: usize = 16;
 
-const LABEL_ROOT: &[u8] = b"p2p-secure-chat/ratchet/v1/root";
-const LABEL_INIT_CHAIN: &[u8] = b"p2p-secure-chat/ratchet/v1/initial-chain-r2i";
-const LABEL_KDF_RK: &[u8] = b"p2p-secure-chat/ratchet/v1/kdf-rk";
-const LABEL_MK: &[u8] = b"p2p-secure-chat/ratchet/v1/message-key";
-const LABEL_CK: &[u8] = b"p2p-secure-chat/ratchet/v1/chain-key";
-const LABEL_AEAD: &[u8] = b"p2p-secure-chat/ratchet/v1/aead";
-const AD_PREFIX: &[u8] = b"p2p-secure-chat/ratchet/v1/ad";
+const LABEL_ROOT: &[u8] = b"symbolon/ratchet/v1/root";
+const LABEL_INIT_CHAIN: &[u8] = b"symbolon/ratchet/v1/initial-chain-r2i";
+const LABEL_KDF_RK: &[u8] = b"symbolon/ratchet/v1/kdf-rk";
+const LABEL_MK: &[u8] = b"symbolon/ratchet/v1/message-key";
+const LABEL_CK: &[u8] = b"symbolon/ratchet/v1/chain-key";
+const LABEL_AEAD: &[u8] = b"symbolon/ratchet/v1/aead";
+const AD_PREFIX: &[u8] = b"symbolon/ratchet/v1/ad";
 
 /// A 32-byte secret that wipes itself when dropped.
 #[derive(Clone)]
@@ -128,7 +128,8 @@ fn derive_roots(shared: &[u8; 32], transcript: &[u8; 32]) -> (Secret32, Secret32
     let mut rk = [0u8; 32];
     let mut ck = [0u8; 32];
     hk.expand(LABEL_ROOT, &mut rk).expect("32 bytes is valid");
-    hk.expand(LABEL_INIT_CHAIN, &mut ck).expect("32 bytes is valid");
+    hk.expand(LABEL_INIT_CHAIN, &mut ck)
+        .expect("32 bytes is valid");
     let mut ad = Vec::with_capacity(AD_PREFIX.len() + 32);
     ad.extend_from_slice(AD_PREFIX);
     // The transcript hash already binds both identities, both ephemerals and
@@ -138,18 +139,35 @@ fn derive_roots(shared: &[u8; 32], transcript: &[u8; 32]) -> (Secret32, Secret32
 }
 
 impl RatchetSeed {
-    pub(crate) fn for_initiator(shared: &[u8; 32], transcript: &[u8; 32], responder_ratchet_public: [u8; 32]) -> Self {
-        let (root_key, initial_chain, ad) = derive_roots(shared, transcript);
-        RatchetSeed { root_key, initial_chain, ad, role: SeedRole::Initiator { responder_ratchet_public } }
-    }
-
-    pub(crate) fn for_responder(shared: &[u8; 32], transcript: &[u8; 32], ratchet_secret: [u8; 32]) -> Self {
+    pub(crate) fn for_initiator(
+        shared: &[u8; 32],
+        transcript: &[u8; 32],
+        responder_ratchet_public: [u8; 32],
+    ) -> Self {
         let (root_key, initial_chain, ad) = derive_roots(shared, transcript);
         RatchetSeed {
             root_key,
             initial_chain,
             ad,
-            role: SeedRole::Responder { ratchet_secret: Secret32(ratchet_secret) },
+            role: SeedRole::Initiator {
+                responder_ratchet_public,
+            },
+        }
+    }
+
+    pub(crate) fn for_responder(
+        shared: &[u8; 32],
+        transcript: &[u8; 32],
+        ratchet_secret: [u8; 32],
+    ) -> Self {
+        let (root_key, initial_chain, ad) = derive_roots(shared, transcript);
+        RatchetSeed {
+            root_key,
+            initial_chain,
+            ad,
+            role: SeedRole::Responder {
+                ratchet_secret: Secret32(ratchet_secret),
+            },
         }
     }
 }
@@ -159,7 +177,8 @@ impl RatchetSeed {
 fn kdf_rk(rk: &Secret32, dh_out: &[u8; 32]) -> (Secret32, Secret32) {
     let hk = Hkdf::<Sha256>::new(Some(&rk.0), dh_out);
     let mut out = [0u8; 64];
-    hk.expand(LABEL_KDF_RK, &mut out).expect("64 bytes is valid");
+    hk.expand(LABEL_KDF_RK, &mut out)
+        .expect("64 bytes is valid");
     let mut new_rk = [0u8; 32];
     let mut ck = [0u8; 32];
     new_rk.copy_from_slice(&out[..32]);
@@ -240,7 +259,13 @@ fn seal(mk: &Secret32, ad: &[u8], header: &[u8; HEADER_LEN], plaintext: &[u8]) -
     aad.extend_from_slice(header);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: &aad })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| ChatError::Ratchet("encryption failed"))
 }
 
@@ -251,7 +276,13 @@ fn open(mk: &Secret32, ad: &[u8], header: &[u8], ciphertext: &[u8]) -> Result<Ve
     aad.extend_from_slice(header);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad: &aad })
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| ChatError::Ratchet("authentication failed"))
 }
 
@@ -293,7 +324,9 @@ impl Ratchet {
     /// Build a ratchet from handshake material.
     pub fn from_seed(seed: RatchetSeed) -> Result<Ratchet> {
         match seed.role {
-            SeedRole::Initiator { responder_ratchet_public } => {
+            SeedRole::Initiator {
+                responder_ratchet_public,
+            } => {
                 let dh_s = StaticSecret::random_from_rng(OsRng);
                 let dh_s_pub = PublicKey::from(&dh_s).to_bytes();
                 // Immediate DH step against the responder's first ratchet key.
@@ -336,15 +369,149 @@ impl Ratchet {
         }
     }
 
+    /// Serialize the COMPLETE state, secrets included, for the session
+    /// state file ([`crate::sessionstate`]). The caller must encrypt the
+    /// result before it touches disk; this function does not.
+    ///
+    /// Restoring an OLD copy of this state after newer messages were sent
+    /// would reuse message keys, which breaks the encryption. The session
+    /// layer therefore saves BEFORE any ciphertext leaves the process.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        fn put32(out: &mut Vec<u8>, b: &[u8; 32]) {
+            out.extend_from_slice(b);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.ad.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.ad);
+        put32(&mut out, &self.dh_s.to_bytes());
+        match &self.dh_r {
+            Some(k) => {
+                out.push(1);
+                put32(&mut out, k);
+            }
+            None => out.push(0),
+        }
+        put32(&mut out, &self.rk.0);
+        put32(&mut out, &self.cks.0);
+        match &self.ckr {
+            Some(k) => {
+                out.push(1);
+                put32(&mut out, &k.0);
+            }
+            None => out.push(0),
+        }
+        for n in [self.ns, self.nr, self.pn] {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        out.extend_from_slice(&(self.skipped_order.len() as u32).to_be_bytes());
+        for key in &self.skipped_order {
+            // Invariant: every key in `skipped_order` is in `skipped`.
+            if let Some(mk) = self.skipped.get(key) {
+                put32(&mut out, &key.0);
+                out.extend_from_slice(&key.1.to_be_bytes());
+                put32(&mut out, &mk.0);
+            }
+        }
+        out
+    }
+
+    /// Inverse of [`Ratchet::to_bytes`]. Strict: any inconsistency is an
+    /// error, and the skipped-key cache is re-capped.
+    pub(crate) fn from_bytes(b: &[u8]) -> Result<Ratchet> {
+        const BAD: ChatError = ChatError::MalformedMessage("bad saved ratchet state");
+        struct R<'a>(&'a [u8]);
+        impl<'a> R<'a> {
+            fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+                if self.0.len() < n {
+                    return Err(BAD);
+                }
+                let (h, t) = self.0.split_at(n);
+                self.0 = t;
+                Ok(h)
+            }
+            fn a32(&mut self) -> Result<[u8; 32]> {
+                Ok(self.take(32)?.try_into().unwrap())
+            }
+            fn u32(&mut self) -> Result<u32> {
+                Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+            }
+            fn flag(&mut self) -> Result<bool> {
+                match self.take(1)?[0] {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(BAD),
+                }
+            }
+        }
+        let mut r = R(b);
+        let ad_len = r.u32()? as usize;
+        if ad_len > 1024 {
+            return Err(BAD);
+        }
+        let ad = r.take(ad_len)?.to_vec();
+        let dh_s = StaticSecret::from(r.a32()?);
+        let dh_s_pub = PublicKey::from(&dh_s).to_bytes();
+        let dh_r = if r.flag()? { Some(r.a32()?) } else { None };
+        let rk = Secret32(r.a32()?);
+        let cks = Secret32(r.a32()?);
+        let ckr = if r.flag()? {
+            Some(Secret32(r.a32()?))
+        } else {
+            None
+        };
+        let (ns, nr, pn) = (r.u32()?, r.u32()?, r.u32()?);
+        let count = r.u32()? as usize;
+        if count > MAX_STORED_SKIPPED {
+            return Err(BAD);
+        }
+        let mut skipped = HashMap::new();
+        let mut skipped_order = VecDeque::new();
+        for _ in 0..count {
+            let pk = r.a32()?;
+            let n = r.u32()?;
+            let mk = Secret32(r.a32()?);
+            skipped_order.push_back((pk, n));
+            skipped.insert((pk, n), mk);
+        }
+        if !r.0.is_empty() {
+            return Err(BAD);
+        }
+        Ok(Ratchet {
+            ad,
+            dh_s,
+            dh_s_pub,
+            dh_r,
+            rk,
+            cks,
+            ckr,
+            ns,
+            nr,
+            pn,
+            skipped,
+            skipped_order,
+        })
+    }
+
     /// Create a matched initiator/responder pair from a shared secret. This
     /// does what the handshake does, without a network. Intended for tests,
     /// benchmarks and fuzzing - real sessions get their seeds from
     /// [`crate::handshake`].
-    pub fn pair_from_shared_secret(shared: &[u8; 32], transcript: &[u8; 32]) -> Result<(Ratchet, Ratchet)> {
+    pub fn pair_from_shared_secret(
+        shared: &[u8; 32],
+        transcript: &[u8; 32],
+    ) -> Result<(Ratchet, Ratchet)> {
         let responder_secret = StaticSecret::random_from_rng(OsRng);
         let responder_pub = PublicKey::from(&responder_secret).to_bytes();
-        let init = Ratchet::from_seed(RatchetSeed::for_initiator(shared, transcript, responder_pub))?;
-        let resp = Ratchet::from_seed(RatchetSeed::for_responder(shared, transcript, responder_secret.to_bytes()))?;
+        let init = Ratchet::from_seed(RatchetSeed::for_initiator(
+            shared,
+            transcript,
+            responder_pub,
+        ))?;
+        let resp = Ratchet::from_seed(RatchetSeed::for_responder(
+            shared,
+            transcript,
+            responder_secret.to_bytes(),
+        ))?;
         Ok((init, resp))
     }
 
@@ -374,9 +541,16 @@ impl Ratchet {
     /// Every call consumes a fresh one-time message key.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let n = self.ns;
-        let next_n = n.checked_add(1).ok_or(ChatError::Ratchet("sending chain exhausted"))?;
+        let next_n = n
+            .checked_add(1)
+            .ok_or(ChatError::Ratchet("sending chain exhausted"))?;
         let (mk, next_ck) = kdf_ck(&self.cks);
-        let header = Header { dh: self.dh_s_pub, pn: self.pn, n }.encode();
+        let header = Header {
+            dh: self.dh_s_pub,
+            pn: self.pn,
+            n,
+        }
+        .encode();
         let sealed = seal(&mk, &self.ad, &header, plaintext)?;
         // Commit only after the AEAD succeeded.
         self.cks = next_ck;
@@ -417,10 +591,16 @@ impl Ratchet {
 
         // 3. Catch up within the current chain, then take this message's key.
         self.skip_message_keys(header.n)?;
-        let ckr = self.ckr.as_ref().ok_or(ChatError::Ratchet("no receiving chain"))?;
+        let ckr = self
+            .ckr
+            .as_ref()
+            .ok_or(ChatError::Ratchet("no receiving chain"))?;
         let (mk, next) = kdf_ck(ckr);
         self.ckr = Some(next);
-        self.nr = self.nr.checked_add(1).ok_or(ChatError::Ratchet("receiving chain exhausted"))?;
+        self.nr = self
+            .nr
+            .checked_add(1)
+            .ok_or(ChatError::Ratchet("receiving chain exhausted"))?;
         open(&mk, &self.ad, header_bytes, ciphertext)
     }
 
@@ -505,9 +685,15 @@ mod tests {
         let (mut a, mut b) = pair();
         for i in 0..20u32 {
             let m = format!("a->b {i}");
-            assert_eq!(b.decrypt(&a.encrypt(m.as_bytes()).unwrap()).unwrap(), m.as_bytes());
+            assert_eq!(
+                b.decrypt(&a.encrypt(m.as_bytes()).unwrap()).unwrap(),
+                m.as_bytes()
+            );
             let m = format!("b->a {i}");
-            assert_eq!(a.decrypt(&b.encrypt(m.as_bytes()).unwrap()).unwrap(), m.as_bytes());
+            assert_eq!(
+                a.decrypt(&b.encrypt(m.as_bytes()).unwrap()).unwrap(),
+                m.as_bytes()
+            );
         }
     }
 
@@ -641,7 +827,10 @@ mod tests {
             for bit in [0u8, 3, 7] {
                 let mut bad = good.clone();
                 bad[byte] ^= 1 << bit;
-                assert!(b.decrypt(&bad).is_err(), "byte {byte} bit {bit} was accepted");
+                assert!(
+                    b.decrypt(&bad).is_err(),
+                    "byte {byte} bit {bit} was accepted"
+                );
             }
         }
         assert_eq!(b.skipped_count(), 0);
@@ -695,8 +884,9 @@ mod tests {
                 p
             },
             [
-                0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
-                0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00,
+                0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
+                0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
+                0x5f, 0x49, 0xb8, 0x00,
             ],
         ];
         for p in evil {
@@ -815,5 +1005,40 @@ mod tests {
             }
             assert!(delivered_ok > 20, "seed {seed} exercised too little");
         }
+    }
+
+    #[test]
+    fn saved_state_round_trips_and_keeps_conversing() {
+        let (mut a, mut b) = Ratchet::pair_from_shared_secret(&[5u8; 32], &[6u8; 32]).unwrap();
+        let w1 = b.encrypt(b"one").unwrap();
+        assert_eq!(a.decrypt(&w1).unwrap(), b"one");
+        let w2 = a.encrypt(b"two").unwrap();
+        // Leave a gap so the skipped-key cache is non-empty.
+        let w3 = a.encrypt(b"three").unwrap();
+        assert_eq!(b.decrypt(&w3).unwrap(), b"three");
+        assert!(b.skipped_count() > 0);
+
+        let mut b2 = Ratchet::from_bytes(&b.to_bytes()).unwrap();
+        let mut a2 = Ratchet::from_bytes(&a.to_bytes()).unwrap();
+        assert_eq!(b2.info(), b.info());
+        // The late message still decrypts from the RESTORED skipped cache.
+        assert_eq!(b2.decrypt(&w2).unwrap(), b"two");
+        // And the restored pair keeps talking both ways.
+        let w4 = b2.encrypt(b"four").unwrap();
+        assert_eq!(a2.decrypt(&w4).unwrap(), b"four");
+        let w5 = a2.encrypt(b"five").unwrap();
+        assert_eq!(b2.decrypt(&w5).unwrap(), b"five");
+    }
+
+    #[test]
+    fn saved_state_rejects_truncation_and_trailing_bytes() {
+        let (a, _b) = Ratchet::pair_from_shared_secret(&[5u8; 32], &[6u8; 32]).unwrap();
+        let bytes = a.to_bytes();
+        for cut in 0..bytes.len() {
+            assert!(Ratchet::from_bytes(&bytes[..cut]).is_err(), "cut {cut}");
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(Ratchet::from_bytes(&extra).is_err());
     }
 }

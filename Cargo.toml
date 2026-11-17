@@ -1,7 +1,7 @@
 [package]
 name = "symbolon"
 description = "Serverless, pinned-key, forward-secret peer-to-peer messaging with signed group governance"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -18,9 +18,9 @@ hkdf = "0.12"
 sha2 = "0.10"
 # --- Cryptographically secure randomness source ---
 rand_core = { version = "0.6", features = ["getrandom"] }
-# --- Password-based key derivation, for encrypting identity keys at rest ---
-# --- Password-based key derivation, for encrypting identity keys at rest ---
-pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"] }
+# --- Memory-hard password-based key derivation (Argon2id), for encrypting
+# --- the identity key at rest. Replaced PBKDF2 (no compatibility kept: unreleased).
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 
 # --- Pinned transitive dependencies ---
 # Newer releases of these crates require the "edition2024" Cargo feature,

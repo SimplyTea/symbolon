@@ -1,98 +1,177 @@
-//! Persistence: making state survive a process restart, not just a network
-//! disconnect (the reliability layer in `reliability.rs`/`session.rs`
-//! already handles the latter; this module is specifically for "the app
-//! was closed and reopened").
+//! Identity at rest: saving and loading a long-term [`Identity`] under a
+//! passphrase.
 //!
-//! Two independent pieces:
+//! (Event logs and other durable state live in [`crate::storage`], behind
+//! pluggable traits. This module is only the passphrase-protected identity
+//! FILE, which [`crate::storage::FileKeyStore`] wraps.)
 //!
-//! - [`EncryptedIdentity`]: save/load a long-term [`Identity`]'s private
-//!   key to disk, encrypted under a passphrase. Nothing about a person's
-//!   identity should ever sit on disk in plaintext.
-//! - [`EventLog`]: a generic append-only log of length-prefixed byte
-//!   records, built directly on [`crate::framing`] (which is already
-//!   generic over any `Read + Write`, so pointing it at a `File` instead of
-//!   a socket costs nothing extra). Used by [`crate::group::GroupHub`] to
-//!   persist every validated roster operation and application message, so
-//!   a group's state - membership, tiers, message history - can be fully
-//!   reconstructed by replaying the log through the exact same validation
-//!   logic used for live traffic (see `GroupHub::from_log`). This is an
-//!   event-sourcing approach: nothing is ever persisted that wasn't first
-//!   independently verified, and replay is just "run it through the
-//!   validator again".
+//! # File format (version 2)
+//!
+//! ```text
+//! offset  size  field
+//!      0     4  magic "SYMI"
+//!      4     2  format version (2), big-endian
+//!      6    16  random salt
+//!     22     4  Argon2id memory cost in KiB
+//!     26     4  Argon2id time cost (passes)
+//!     30     4  Argon2id parallelism (lanes)
+//!     34    12  random AEAD nonce
+//!     46    32  key commitment
+//!     78  ...   ChaCha20-Poly1305 ciphertext of the 32-byte secret, + 16-byte tag
+//! ```
+//!
+//! Everything before the ciphertext is the header; it is bound into the
+//! AEAD as associated data, so no field can be altered or swapped between
+//! files without detection.
+//!
+//! # Key derivation
+//! `master = Argon2id(passphrase, salt, m, t, p)` (32 bytes). Two
+//! independent keys are then derived from it with HKDF-SHA256 under
+//! different labels: the AEAD key, and a 32-byte *commitment*.
+//!
+//! * **Argon2id** is memory-hard, so a stolen file is expensive to attack
+//!   with GPUs/ASICs (PBKDF2 is not). It runs once per unlock, not per
+//!   peer, group or message.
+//! * **Key commitment.** ChaCha20-Poly1305 is not "key committing": in
+//!   principle a ciphertext can be crafted that decrypts successfully under
+//!   two different keys. The stored commitment is a one-way function of the
+//!   same master secret, checked in constant time BEFORE decrypting, so a
+//!   file is bound to exactly one passphrase-derived key. It costs 32 bytes
+//!   in this file only (nothing is added to messages).
+//!
+//! A wrong passphrase, a corrupted file and a tampered file are all reported
+//! identically as [`ChatError::DecryptionFailed`], by design.
+//!
+//! # Compatibility
+//! None. Symbolon is unreleased; the older PBKDF2 format (magic "P2PI") is
+//! not read.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Mutex;
 
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{aead::Aead, aead::KeyInit, aead::Payload, ChaCha20Poly1305, Key, Nonce};
-use pbkdf2::hmac::Hmac;
-use pbkdf2::pbkdf2;
+use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::error::{ChatError, Result};
-use crate::framing::{read_frame, write_frame};
 use crate::identity::Identity;
 
-const IDENTITY_FILE_MAGIC: &[u8; 4] = b"P2PI";
-const IDENTITY_FILE_VERSION: u16 = 1;
-/// PBKDF2 iteration count. This is a work-factor knob: higher is slower to
-/// brute-force but slower to load legitimately too. 600,000 follows current
-/// (2024-era) OWASP guidance for PBKDF2-HMAC-SHA256; bump this over time as
-/// hardware gets faster, the same way any password-based KDF needs revisiting.
-const PBKDF2_ROUNDS: u32 = 600_000;
+const MAGIC: &[u8; 4] = b"SYMI";
+const FORMAT_VERSION: u16 = 2;
+const HEADER_LEN: usize = 4 + 2 + 16 + 4 + 4 + 4 + 12 + 32; // = 78
+const SECRET_LEN: usize = 32;
+const TAG_LEN: usize = 16;
+
+/// HKDF labels (domain separation: the two derived values are independent).
+const LABEL_ENC_KEY: &[u8] = b"symbolon/identity-file/v2/aead-key";
+const LABEL_COMMITMENT: &[u8] = b"symbolon/identity-file/v2/key-commitment";
+
+/// Upper bounds accepted when LOADING, so a crafted file cannot make us
+/// allocate gigabytes or spin for minutes before we even know it is invalid.
+const MAX_MEMORY_KIB: u32 = 1024 * 1024; // 1 GiB
+const MAX_TIME_COST: u32 = 64;
+const MAX_LANES: u32 = 16;
+
+/// Argon2id cost settings. They are stored in the file header, so loading
+/// needs no configuration and costs can be raised later without breaking
+/// existing files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfParams {
+    /// Memory in KiB (65536 = 64 MiB).
+    pub memory_kib: u32,
+    /// Number of passes over memory.
+    pub time_cost: u32,
+    /// Parallel lanes (1 keeps the cost predictable on small devices).
+    pub lanes: u32,
+}
+
+impl Default for KdfParams {
+    /// 64 MiB, 3 passes, 1 lane: this follows the OWASP "second
+    /// recommendation" tier and is meant to land around half a second to a
+    /// second on a Raspberry Pi class device. Tune with `cargo run
+    /// --release --example bench` on the real hardware.
+    fn default() -> Self {
+        KdfParams {
+            memory_kib: 64 * 1024,
+            time_cost: 3,
+            lanes: 1,
+        }
+    }
+}
+
+impl KdfParams {
+    /// Deliberately weak settings so tests run fast. NEVER use in real code.
+    pub fn insecure_fast_for_tests() -> Self {
+        KdfParams {
+            memory_kib: 64,
+            time_cost: 1,
+            lanes: 1,
+        }
+    }
+}
 
 /// Save and load a long-term [`Identity`], encrypted at rest under a
-/// passphrase. Nothing here is a substitute for full disk encryption or a
-/// real OS keystore - it's a baseline so a stolen backup file isn't
-/// immediately equivalent to a stolen identity.
+/// passphrase. This is a baseline, not a substitute for full-disk
+/// encryption or an OS keystore (see [`crate::storage::KeyStore`] for
+/// plugging those in).
 pub struct EncryptedIdentity;
 
 impl EncryptedIdentity {
     /// Encrypt `identity`'s private key under `passphrase` and write it to
-    /// `path`, overwriting any existing file. Uses [`PBKDF2_ROUNDS`] as the
-    /// key-derivation work factor - see [`EncryptedIdentity::save_with_rounds`]
-    /// if you need a different value (e.g. faster iteration in tests).
+    /// `path` (owner-only permissions on Unix), overwriting any existing file.
     pub fn save(identity: &Identity, path: &Path, passphrase: &str) -> Result<()> {
-        Self::save_with_rounds(identity, path, passphrase, PBKDF2_ROUNDS)
+        Self::save_with_params(identity, path, passphrase, KdfParams::default())
     }
 
-    /// Same as [`EncryptedIdentity::save`], with an explicit PBKDF2 round
-    /// count. The round count is stored in the file's own header and read
-    /// back automatically by [`EncryptedIdentity::load`] - callers never
-    /// need to remember or pass it in again.
-    pub fn save_with_rounds(identity: &Identity, path: &Path, passphrase: &str, rounds: u32) -> Result<()> {
+    /// [`EncryptedIdentity::save`] with explicit Argon2id costs.
+    pub fn save_with_params(
+        identity: &Identity,
+        path: &Path,
+        passphrase: &str,
+        params: KdfParams,
+    ) -> Result<()> {
+        check_params(&params)?;
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
 
-        let key = derive_key_with_rounds(passphrase, &salt, rounds);
+        let master = derive_master(passphrase, &salt, &params)?;
+        let (enc_key, commitment) = split_master(&master);
 
-        // Bind the file's own header (magic, version, salt, rounds, nonce)
-        // into the AEAD associated data, so none of it can be swapped
-        // between two encrypted identity files without detection.
-        let mut aad = Vec::new();
-        aad.extend_from_slice(IDENTITY_FILE_MAGIC);
-        aad.extend_from_slice(&IDENTITY_FILE_VERSION.to_be_bytes());
-        aad.extend_from_slice(&salt);
-        aad.extend_from_slice(&rounds.to_be_bytes());
-        aad.extend_from_slice(&nonce_bytes);
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(MAGIC);
+        header.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+        header.extend_from_slice(&salt);
+        header.extend_from_slice(&params.memory_kib.to_be_bytes());
+        header.extend_from_slice(&params.time_cost.to_be_bytes());
+        header.extend_from_slice(&params.lanes.to_be_bytes());
+        header.extend_from_slice(&nonce_bytes);
+        header.extend_from_slice(&commitment);
+        debug_assert_eq!(header.len(), HEADER_LEN);
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let secret = Zeroizing::new(identity.secret_bytes());
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*enc_key));
         let ciphertext = cipher
-            .encrypt(nonce, Payload { msg: &identity.secret_bytes(), aad: &aad })
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &secret[..],
+                    aad: &header,
+                },
+            )
             .map_err(|_| ChatError::DecryptionFailed)?;
 
-        let mut out = aad; // header bytes, reused as the start of the file
+        let mut out = header;
         out.extend_from_slice(&ciphertext);
 
-        // Owner-only permissions (0600) from the moment the file exists, so
-        // there is no window where another local user can read it. On
-        // non-Unix platforms the OS default applies.
-        let mut opts = std::fs::OpenOptions::new();
+        // Owner-only (0600) from the moment the file exists, so there is no
+        // window in which another local user can read it.
+        let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
@@ -105,147 +184,116 @@ impl EncryptedIdentity {
         Ok(())
     }
 
-    /// Decrypt and load an [`Identity`] previously saved with
-    /// [`EncryptedIdentity::save`]. Returns [`ChatError::DecryptionFailed`]
-    /// if `passphrase` is wrong (indistinguishable, by design, from the
-    /// file being corrupted or tampered with).
+    /// Decrypt and load an identity saved with [`EncryptedIdentity::save`].
+    /// Returns [`ChatError::DecryptionFailed`] for a wrong passphrase,
+    /// corruption or tampering (indistinguishable by design).
     pub fn load(path: &Path, passphrase: &str) -> Result<Identity> {
         let mut bytes = Vec::new();
-        File::open(path)?.read_to_end(&mut bytes)?;
+        std::fs::File::open(path)?.read_to_end(&mut bytes)?;
 
-        if bytes.len() < 4 + 2 + 16 + 4 + 12 {
-            return Err(ChatError::MalformedMessage("identity file too short"));
+        if bytes.len() != HEADER_LEN + SECRET_LEN + TAG_LEN {
+            return Err(ChatError::MalformedMessage(
+                "identity file has the wrong size",
+            ));
         }
-        let magic = &bytes[0..4];
-        if magic != IDENTITY_FILE_MAGIC {
+        if &bytes[0..4] != MAGIC {
             return Err(ChatError::MalformedMessage("not a symbolon identity file"));
         }
         let version = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
-        if version != IDENTITY_FILE_VERSION {
+        if version != FORMAT_VERSION {
             return Err(ChatError::UnsupportedVersion);
         }
         let salt: [u8; 16] = bytes[6..22].try_into().unwrap();
-        let rounds = u32::from_be_bytes(bytes[22..26].try_into().unwrap());
-        let nonce_bytes: [u8; 12] = bytes[26..38].try_into().unwrap();
-        let aad = &bytes[0..38];
-        let ciphertext = &bytes[38..];
+        let params = KdfParams {
+            memory_kib: u32::from_be_bytes(bytes[22..26].try_into().unwrap()),
+            time_cost: u32::from_be_bytes(bytes[26..30].try_into().unwrap()),
+            lanes: u32::from_be_bytes(bytes[30..34].try_into().unwrap()),
+        };
+        let nonce_bytes: [u8; 12] = bytes[34..46].try_into().unwrap();
+        let stored_commitment: [u8; 32] = bytes[46..78].try_into().unwrap();
+        let (header, ciphertext) = bytes.split_at(HEADER_LEN);
 
-        let key = derive_key_with_rounds(passphrase, &salt, rounds);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let plaintext = cipher
-            .decrypt(nonce, Payload { msg: ciphertext, aad })
-            .map_err(|_| ChatError::DecryptionFailed)?;
+        // Refuse absurd costs BEFORE doing any expensive work.
+        check_params(&params)?;
 
-        let secret: [u8; 32] = plaintext.try_into().map_err(|_| ChatError::MalformedMessage("decrypted identity has the wrong length"))?;
+        let master = derive_master(passphrase, &salt, &params)?;
+        let (enc_key, commitment) = split_master(&master);
+
+        // Key commitment first, in constant time: if it does not match, the
+        // passphrase (or file) is wrong and we never attempt decryption.
+        if !ct_eq(&commitment, &stored_commitment) {
+            return Err(ChatError::DecryptionFailed);
+        }
+
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*enc_key));
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&nonce_bytes),
+                    Payload {
+                        msg: ciphertext,
+                        aad: header,
+                    },
+                )
+                .map_err(|_| ChatError::DecryptionFailed)?,
+        );
+        let secret: [u8; 32] = plaintext
+            .as_slice()
+            .try_into()
+            .map_err(|_| ChatError::MalformedMessage("decrypted identity has the wrong length"))?;
         Ok(Identity::from_bytes(&secret))
     }
 }
 
-fn derive_key_with_rounds(passphrase: &str, salt: &[u8; 16], rounds: u32) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    // PBKDF2-HMAC-SHA256 turns a (comparatively low-entropy) human
-    // passphrase into a key an attacker can't brute-force nearly as
-    // cheaply as they could brute-force the passphrase directly, thanks to
-    // the deliberately expensive, tunable round count.
-    pbkdf2::<Hmac<Sha256>>(passphrase.as_bytes(), salt, rounds, &mut key).expect("32 bytes is a valid PBKDF2 output length");
-    key
-}
-
-/// A simple append-only log of length-prefixed byte records, backed by a
-/// file. Built on the exact same framing [`crate::session::Session`] uses
-/// over sockets - a log is just a very patient, very persistent peer.
-///
-/// Optionally encrypts every record at rest under a caller-supplied key
-/// (see [`EventLog::open_encrypted`]) - important for
-/// [`crate::group::GroupHub`], whose log otherwise would otherwise contain
-/// plaintext chat content sitting unencrypted on disk, which would quietly
-/// undermine the "security and privacy first" goal of everything else in
-/// this crate. Each record gets its own fresh random nonce (stored
-/// alongside its ciphertext) rather than a counter, since log records don't
-/// have a natural, always-available sequence number the way session
-/// traffic does - a random 96-bit nonce has negligible collision
-/// probability at any realistic log size.
-pub struct EventLog {
-    file: Mutex<File>,
-    key: Option<crate::crypto::AeadKey>,
-}
-
-impl EventLog {
-    /// Open (creating if necessary) a plaintext event log at `path`.
-    /// Prefer [`EventLog::open_encrypted`] for anything containing real
-    /// user content.
-    pub fn open(path: &Path) -> Result<EventLog> {
-        let file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
-        Ok(EventLog { file: Mutex::new(file), key: None })
-    }
-
-    /// Open (creating if necessary) an event log at `path` whose records
-    /// are encrypted at rest under `key`.
-    pub fn open_encrypted(path: &Path, key: crate::crypto::AeadKey) -> Result<EventLog> {
-        let file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
-        Ok(EventLog { file: Mutex::new(file), key: Some(key) })
-    }
-
-    /// Append one record. Durable once this returns (the write is flushed
-    /// to the OS; callers wanting an fsync guarantee on every record can
-    /// call [`EventLog::sync`] afterward - left separate since fsync-per-
-    /// record is a real throughput cost callers should opt into knowingly).
-    pub fn append(&self, bytes: &[u8]) -> Result<()> {
-        let mut file = self.file.lock().unwrap();
-        match &self.key {
-            None => write_frame(&mut *file, bytes),
-            Some(key) => {
-                let mut nonce_bytes = [0u8; 12];
-                OsRng.fill_bytes(&mut nonce_bytes);
-                let nonce = Nonce::from_slice(&nonce_bytes);
-                let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.0));
-                let ciphertext = cipher.encrypt(nonce, bytes).map_err(|_| ChatError::DecryptionFailed)?;
-                let mut record = Vec::with_capacity(12 + ciphertext.len());
-                record.extend_from_slice(&nonce_bytes);
-                record.extend_from_slice(&ciphertext);
-                write_frame(&mut *file, &record)
-            }
-        }
-    }
-
-    /// Force all appended records to durable storage.
-    pub fn sync(&self) -> Result<()> {
-        self.file.lock().unwrap().sync_all()?;
+/// Reject parameter sets that are absurdly large (DoS) or that Argon2 itself
+/// would refuse.
+fn check_params(p: &KdfParams) -> Result<()> {
+    let ok = p.lanes >= 1
+        && p.lanes <= MAX_LANES
+        && p.time_cost >= 1
+        && p.time_cost <= MAX_TIME_COST
+        && p.memory_kib >= 8 * p.lanes
+        && p.memory_kib <= MAX_MEMORY_KIB;
+    if ok {
         Ok(())
+    } else {
+        Err(ChatError::MalformedMessage(
+            "identity file has unacceptable KDF parameters",
+        ))
     }
+}
 
-    /// Read every record currently in the log, in the order they were
-    /// appended, without disturbing the log's append position (a fresh
-    /// read handle is used internally). Pass the same key used to open the
-    /// log (if any) to decrypt; a missing or wrong key surfaces as
-    /// [`ChatError::DecryptionFailed`] on the first record, same as any
-    /// other AEAD authentication failure.
-    pub fn read_all(path: &Path, key: Option<&crate::crypto::AeadKey>) -> Result<Vec<Vec<u8>>> {
-        let mut file = OpenOptions::new().read(true).open(path)?;
-        file.seek(SeekFrom::Start(0))?;
-        let mut out = Vec::new();
-        loop {
-            match read_frame(&mut file) {
-                Ok(record) => match key {
-                    None => out.push(record),
-                    Some(key) => {
-                        if record.len() < 12 {
-                            return Err(ChatError::MalformedMessage("encrypted log record too short"));
-                        }
-                        let (nonce_bytes, ciphertext) = record.split_at(12);
-                        let nonce = Nonce::from_slice(nonce_bytes);
-                        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.0));
-                        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| ChatError::DecryptionFailed)?;
-                        out.push(plaintext);
-                    }
-                },
-                Err(ChatError::ConnectionClosed) => break, // clean EOF between records
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(out)
+/// Passphrase -> 32-byte master secret via Argon2id.
+fn derive_master(passphrase: &str, salt: &[u8; 16], p: &KdfParams) -> Result<Zeroizing<[u8; 32]>> {
+    let params = Params::new(p.memory_kib, p.time_cost, p.lanes, Some(32))
+        .map_err(|_| ChatError::MalformedMessage("invalid KDF parameters"))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = Zeroizing::new([0u8; 32]);
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, &mut *out)
+        .map_err(|_| ChatError::MalformedMessage("key derivation failed"))?;
+    Ok(out)
+}
+
+/// Master secret -> (AEAD key, key commitment), independent via HKDF labels.
+fn split_master(master: &[u8; 32]) -> (Zeroizing<[u8; 32]>, [u8; 32]) {
+    let hk = Hkdf::<Sha256>::new(None, master);
+    let mut enc = Zeroizing::new([0u8; 32]);
+    let mut commit = [0u8; 32];
+    hk.expand(LABEL_ENC_KEY, &mut *enc)
+        .expect("32 bytes is a valid HKDF output length");
+    hk.expand(LABEL_COMMITMENT, &mut commit)
+        .expect("32 bytes is a valid HKDF output length");
+    (enc, commit)
+}
+
+/// Constant-time equality for equal-length byte arrays.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
     }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -258,33 +306,52 @@ mod tests {
         p
     }
 
-    /// A small round count for tests only - real correctness doesn't
-    /// depend on the round count, just speed, and 600k rounds x many test
-    /// cases makes the suite unpleasantly slow. Production code must never
-    /// use this - always go through `save`/`load`.
-    const TEST_ROUNDS: u32 = 100;
+    fn fast() -> KdfParams {
+        KdfParams::insecure_fast_for_tests()
+    }
 
     #[test]
     fn identity_round_trips_through_encryption() {
         let path = temp_path("identity-roundtrip");
         let identity = Identity::generate();
-        let original_fingerprint = identity.fingerprint();
-
-        EncryptedIdentity::save_with_rounds(&identity, &path, "correct horse battery staple", TEST_ROUNDS).unwrap();
+        EncryptedIdentity::save_with_params(
+            &identity,
+            &path,
+            "correct horse battery staple",
+            fast(),
+        )
+        .unwrap();
         let loaded = EncryptedIdentity::load(&path, "correct horse battery staple").unwrap();
+        assert_eq!(loaded.fingerprint(), identity.fingerprint());
+        let _ = std::fs::remove_file(&path);
+    }
 
-        assert_eq!(loaded.fingerprint(), original_fingerprint);
+    #[test]
+    fn default_save_and_load_work_with_production_costs() {
+        let path = temp_path("identity-default-cost");
+        let identity = Identity::generate();
+        EncryptedIdentity::save(&identity, &path, "pw").unwrap();
+        assert_eq!(
+            EncryptedIdentity::load(&path, "pw").unwrap().fingerprint(),
+            identity.fingerprint()
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn wrong_passphrase_is_rejected() {
         let path = temp_path("identity-wrong-pass");
-        let identity = Identity::generate();
-        EncryptedIdentity::save_with_rounds(&identity, &path, "the real passphrase", TEST_ROUNDS).unwrap();
-
-        let result = EncryptedIdentity::load(&path, "a guess");
-        assert!(matches!(result, Err(ChatError::DecryptionFailed)));
+        EncryptedIdentity::save_with_params(
+            &Identity::generate(),
+            &path,
+            "the real passphrase",
+            fast(),
+        )
+        .unwrap();
+        assert!(matches!(
+            EncryptedIdentity::load(&path, "a guess"),
+            Err(ChatError::DecryptionFailed)
+        ));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -292,126 +359,99 @@ mod tests {
     #[test]
     fn saved_identity_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("p2p-perm-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("symbolon-perm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("id.enc");
         let _ = std::fs::remove_file(&path);
-        EncryptedIdentity::save_with_rounds(&Identity::generate(), &path, "pw", TEST_ROUNDS).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        EncryptedIdentity::save_with_params(&Identity::generate(), &path, "pw", fast()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn tampered_identity_file_is_rejected() {
-        let path = temp_path("identity-tampered");
-        let identity = Identity::generate();
-        EncryptedIdentity::save_with_rounds(&identity, &path, "passphrase", TEST_ROUNDS).unwrap();
+    fn flipping_any_single_byte_of_the_file_is_detected() {
+        let path = temp_path("identity-bitflip");
+        EncryptedIdentity::save_with_params(&Identity::generate(), &path, "pw", fast()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for i in 0..original.len() {
+            let mut bad = original.clone();
+            bad[i] ^= 0x01;
+            std::fs::write(&path, &bad).unwrap();
+            assert!(
+                EncryptedIdentity::load(&path, "pw").is_err(),
+                "flip at byte {i} was not detected"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 
-        // Flip a byte in the ciphertext region (well past the header).
+    #[test]
+    fn the_key_commitment_rejects_a_wrong_key_before_decryption() {
+        // Replace the stored commitment with the right one for a DIFFERENT
+        // passphrase: even a header that is otherwise self-consistent must
+        // not unlock under the wrong passphrase.
+        let path = temp_path("identity-commit");
+        EncryptedIdentity::save_with_params(&Identity::generate(), &path, "right", fast()).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
+        let salt: [u8; 16] = bytes[6..22].try_into().unwrap();
+        let master = derive_master("wrong", &salt, &fast()).unwrap();
+        let (_, wrong_commit) = split_master(&master);
+        bytes[46..78].copy_from_slice(&wrong_commit);
         std::fs::write(&path, &bytes).unwrap();
-
-        let result = EncryptedIdentity::load(&path, "passphrase");
-        assert!(matches!(result, Err(ChatError::DecryptionFailed)));
+        assert!(matches!(
+            EncryptedIdentity::load(&path, "right"),
+            Err(ChatError::DecryptionFailed)
+        ));
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn production_default_round_count_meets_current_owasp_guidance() {
-        // Not a security test so much as a "did someone accidentally turn
-        // this down" tripwire - the constant is what actually matters at
-        // runtime, this just keeps it honest.
-        assert!(PBKDF2_ROUNDS >= 600_000);
-    }
-
-    #[test]
-    fn event_log_round_trips_multiple_records_in_order() {
-        let path = temp_path("event-log-roundtrip");
-        let _ = std::fs::remove_file(&path);
-        let log = EventLog::open(&path).unwrap();
-        log.append(b"first").unwrap();
-        log.append(b"second").unwrap();
-        log.append(b"third").unwrap();
-        log.sync().unwrap();
-
-        let all = EventLog::read_all(&path, None).unwrap();
-        assert_eq!(all, vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]);
+    fn old_pbkdf2_files_and_garbage_are_refused_not_misread() {
+        let path = temp_path("identity-old-format");
+        let mut old = b"P2PI".to_vec();
+        old.extend_from_slice(&[0u8; 80]);
+        std::fs::write(&path, &old).unwrap();
+        assert!(EncryptedIdentity::load(&path, "pw").is_err());
+        std::fs::write(&path, b"").unwrap();
+        assert!(EncryptedIdentity::load(&path, "pw").is_err());
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn encrypted_event_log_round_trips() {
-        let path = temp_path("event-log-encrypted");
-        let _ = std::fs::remove_file(&path);
-        let key = crate::crypto::AeadKey([9u8; 32]);
-        let log = EventLog::open_encrypted(&path, key.clone()).unwrap();
-        log.append(b"secret message one").unwrap();
-        log.append(b"secret message two").unwrap();
-        log.sync().unwrap();
-
-        let all = EventLog::read_all(&path, Some(&key)).unwrap();
-        assert_eq!(all, vec![b"secret message one".to_vec(), b"secret message two".to_vec()]);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn encrypted_event_log_is_actually_unreadable_without_the_key() {
-        let path = temp_path("event-log-confidentiality");
-        let _ = std::fs::remove_file(&path);
-        let key = crate::crypto::AeadKey([9u8; 32]);
-        let log = EventLog::open_encrypted(&path, key).unwrap();
-        log.append(b"the launch code is 4-8-15-16-23-42").unwrap();
-        log.sync().unwrap();
-
-        // Confirm the plaintext really isn't sitting on disk in the clear.
-        let raw_file_bytes = std::fs::read(&path).unwrap();
-        let contains_plaintext = raw_file_bytes.windows(b"launch code".len()).any(|w| w == b"launch code");
-        assert!(!contains_plaintext, "plaintext content must not appear anywhere in the on-disk file");
-
-        // And reading it back with the wrong key fails rather than
-        // silently returning garbage.
-        let wrong_key = crate::crypto::AeadKey([1u8; 32]);
-        assert!(matches!(EventLog::read_all(&path, Some(&wrong_key)), Err(ChatError::DecryptionFailed)));
+    fn absurd_kdf_parameters_in_a_file_are_refused_without_doing_the_work() {
+        let path = temp_path("identity-dos");
+        EncryptedIdentity::save_with_params(&Identity::generate(), &path, "pw", fast()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[22..26].copy_from_slice(&u32::MAX.to_be_bytes()); // 4 TiB of memory
+        std::fs::write(&path, &bytes).unwrap();
+        let start = std::time::Instant::now();
+        assert!(EncryptedIdentity::load(&path, "pw").is_err());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "must fail fast, not attempt the KDF"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn reading_an_encrypted_log_without_supplying_a_key_fails_closed() {
-        let path = temp_path("event-log-no-key");
-        let _ = std::fs::remove_file(&path);
-        let key = crate::crypto::AeadKey([9u8; 32]);
-        let log = EventLog::open_encrypted(&path, key).unwrap();
-        log.append(b"hello").unwrap();
-        log.sync().unwrap();
-
-        // Reading as if it were a plaintext log must not "succeed" with
-        // garbage - the record is too short / fails frame parsing as raw
-        // content, or at minimum never yields the real plaintext.
-        let result = EventLog::read_all(&path, None);
-        if let Ok(records) = result {
-            assert_ne!(records, vec![b"hello".to_vec()]);
-        }
-        let _ = std::fs::remove_file(&path);
+    fn production_defaults_are_not_accidentally_weakened() {
+        let d = KdfParams::default();
+        assert!(d.memory_kib >= 64 * 1024 && d.time_cost >= 3);
     }
+
     #[test]
-    fn event_log_persists_across_separate_open_calls() {
-        let path = temp_path("event-log-reopen");
-        let _ = std::fs::remove_file(&path);
-        {
-            let log = EventLog::open(&path).unwrap();
-            log.append(b"before restart").unwrap();
-            log.sync().unwrap();
-        }
-        {
-            let log = EventLog::open(&path).unwrap();
-            log.append(b"after restart").unwrap();
-            log.sync().unwrap();
-        }
-        let all = EventLog::read_all(&path, None).unwrap();
-        assert_eq!(all, vec![b"before restart".to_vec(), b"after restart".to_vec()]);
-        let _ = std::fs::remove_file(&path);
+    fn saving_with_unacceptable_params_fails() {
+        let path = temp_path("identity-bad-params");
+        let bad = KdfParams {
+            memory_kib: 0,
+            time_cost: 0,
+            lanes: 0,
+        };
+        assert!(
+            EncryptedIdentity::save_with_params(&Identity::generate(), &path, "pw", bad).is_err()
+        );
     }
 }

@@ -21,7 +21,6 @@
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
-use std::collections::HashMap;
 
 use crate::error::{ChatError, Result};
 
@@ -95,31 +94,61 @@ impl Identity {
 /// identities that are not in here are rejected before any application data
 /// is exchanged, closing off impersonation and unknown-attacker MITM
 /// attempts against the handshake.
-#[derive(Default)]
 pub struct PeerRegistry {
-    trusted: HashMap<PeerId, VerifyingKey>,
+    store: std::sync::Arc<dyn crate::truststore::TrustStore>,
+}
+
+impl Default for PeerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PeerRegistry {
+    /// A registry backed by a fresh in-memory [`crate::truststore::MemoryTrustStore`].
     pub fn new() -> Self {
-        Self::default()
+        Self::with_store(std::sync::Arc::new(
+            crate::truststore::MemoryTrustStore::new(),
+        ))
+    }
+
+    /// A registry backed by any [`crate::truststore::TrustStore`]. Clones of
+    /// the `Arc` share one list, so approvals made in your UI take effect
+    /// for new handshakes immediately.
+    pub fn with_store(store: std::sync::Arc<dyn crate::truststore::TrustStore>) -> Self {
+        PeerRegistry { store }
+    }
+
+    /// The backing store (to list, approve or revoke keys).
+    pub fn store(&self) -> &std::sync::Arc<dyn crate::truststore::TrustStore> {
+        &self.store
     }
 
     /// Pin a peer's public key as trusted. Call this only after verifying
-    /// the key out-of-band (see module docs).
+    /// the key out-of-band (see module docs). If the backing store fails to
+    /// persist, the error is returned by [`PeerRegistry::try_trust`]; this
+    /// convenience form ignores it (fine for the in-memory default).
     pub fn trust(&mut self, public_key: VerifyingKey) -> PeerId {
         let id = fingerprint(&public_key);
-        self.trusted.insert(id.clone(), public_key);
+        let _ = self.store.add(public_key);
         id
     }
 
+    /// Like [`PeerRegistry::trust`] but reports store failures.
+    pub fn try_trust(&self, public_key: VerifyingKey) -> Result<PeerId> {
+        let id = fingerprint(&public_key);
+        self.store.add(public_key)?;
+        Ok(id)
+    }
+
     /// Look up whether a given public key is trusted, returning its
-    /// fingerprint if so.
+    /// fingerprint if so. An untrusted key is recorded in the store's
+    /// approval queue (if it has one) and rejected.
     pub fn verify_trusted(&self, public_key: &VerifyingKey) -> Result<PeerId> {
-        let id = fingerprint(public_key);
-        if self.trusted.contains_key(&id) {
-            Ok(id)
+        if self.store.is_trusted(public_key) {
+            Ok(fingerprint(public_key))
         } else {
+            self.store.record_unknown(public_key);
             Err(ChatError::UnknownPeer)
         }
     }
@@ -149,12 +178,16 @@ pub fn encode_public_key(key: &VerifyingKey) -> String {
 pub fn decode_public_key(hex: &str) -> Result<VerifyingKey> {
     let hex = hex.trim();
     if hex.len() != 64 || !hex.is_ascii() {
-        return Err(ChatError::MalformedMessage("public key must be 64 hex characters"));
+        return Err(ChatError::MalformedMessage(
+            "public key must be 64 hex characters",
+        ));
     }
     let mut bytes = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let pair = std::str::from_utf8(chunk).map_err(|_| ChatError::MalformedMessage("public key is not hex"))?;
-        bytes[i] = u8::from_str_radix(pair, 16).map_err(|_| ChatError::MalformedMessage("public key is not hex"))?;
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|_| ChatError::MalformedMessage("public key is not hex"))?;
+        bytes[i] = u8::from_str_radix(pair, 16)
+            .map_err(|_| ChatError::MalformedMessage("public key is not hex"))?;
     }
     VerifyingKey::from_bytes(&bytes).map_err(|_| ChatError::InvalidPublicKey)
 }
@@ -169,12 +202,22 @@ mod key_hex_tests {
         let hex = encode_public_key(&id.public_key());
         assert_eq!(hex.len(), 64);
         assert_eq!(decode_public_key(&hex).unwrap(), id.public_key());
-        assert_eq!(decode_public_key(&format!("  {hex}\n")).unwrap(), id.public_key());
+        assert_eq!(
+            decode_public_key(&format!("  {hex}\n")).unwrap(),
+            id.public_key()
+        );
     }
 
     #[test]
     fn malformed_public_key_strings_are_rejected() {
-        for bad in ["", "abcd", &"zz".repeat(32), &"0".repeat(63), &"0".repeat(65), "é".repeat(32).as_str()] {
+        for bad in [
+            "",
+            "abcd",
+            &"zz".repeat(32),
+            &"0".repeat(63),
+            &"0".repeat(65),
+            "é".repeat(32).as_str(),
+        ] {
             assert!(decode_public_key(bad).is_err(), "accepted {bad:?}");
         }
     }

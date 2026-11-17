@@ -66,11 +66,23 @@ fn nonce_for(channel: Channel, seq: u64) -> Nonce {
 /// authenticating (but not encrypting) the associated data `aad` as well.
 /// `aad` is used to bind context - such as the visible channel/seq header -
 /// into the authentication tag without needing to encrypt it.
-pub fn encrypt(key: &AeadKey, channel: Channel, seq: u64, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub fn encrypt(
+    key: &AeadKey,
+    channel: Channel,
+    seq: u64,
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.0));
     let nonce = nonce_for(channel, seq);
     cipher
-        .encrypt(&nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| ChatError::DecryptionFailed) // encryption itself can't really fail here
 }
 
@@ -78,11 +90,23 @@ pub fn encrypt(key: &AeadKey, channel: Channel, seq: u64, aad: &[u8], plaintext:
 /// if the authentication tag doesn't match - i.e. the data was corrupted or
 /// tampered with, or `seq`/`channel`/`aad` don't match what the sender
 /// actually used.
-pub fn decrypt(key: &AeadKey, channel: Channel, seq: u64, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+pub fn decrypt(
+    key: &AeadKey,
+    channel: Channel,
+    seq: u64,
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.0));
     let nonce = nonce_for(channel, seq);
     cipher
-        .decrypt(&nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| ChatError::DecryptionFailed)
 }
 

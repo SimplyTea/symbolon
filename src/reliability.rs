@@ -51,7 +51,10 @@ pub struct Outbox {
 
 impl Outbox {
     pub fn new() -> Self {
-        Outbox { next_seq: 1, unacked: BTreeMap::new() }
+        Outbox {
+            next_seq: 1,
+            unacked: BTreeMap::new(),
+        }
     }
 
     /// Record a newly-sent message and return the sequence number assigned
@@ -87,7 +90,8 @@ impl Outbox {
     /// throw away data it hasn't actually got).
     pub fn apply_ack(&mut self, cumulative_ack: u64, missing: &[u64]) {
         let missing_set: BTreeSet<u64> = missing.iter().copied().collect();
-        self.unacked.retain(|&seq, _| seq > cumulative_ack || missing_set.contains(&seq));
+        self.unacked
+            .retain(|&seq, _| seq > cumulative_ack || missing_set.contains(&seq));
     }
 
     /// Wire bytes for every message the peer has told us (via `missing`)
@@ -109,10 +113,68 @@ impl Outbox {
             .collect()
     }
 
+    /// Undo [`Outbox::reserve_seq`] + [`Outbox::store`] for `seq`, which
+    /// must be the most recently reserved number. Used when persisting the
+    /// new state failed and the send is being abandoned.
+    pub fn rollback(&mut self, seq: u64) {
+        self.unacked.remove(&seq);
+        if self.next_seq == seq + 1 {
+            self.next_seq = seq;
+        }
+    }
+
+    /// Serialize (for the session state file). Stored blobs are already
+    /// ratchet ciphertext.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.next_seq.to_be_bytes());
+        out.extend_from_slice(&(self.unacked.len() as u32).to_be_bytes());
+        for (seq, blob) in &self.unacked {
+            out.extend_from_slice(&seq.to_be_bytes());
+            out.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+            out.extend_from_slice(blob);
+        }
+        out
+    }
+
+    pub(crate) fn from_bytes(b: &[u8]) -> Option<Outbox> {
+        let mut c = Cursor(b);
+        let next_seq = c.u64()?;
+        let n = c.u32()?;
+        let mut unacked = BTreeMap::new();
+        for _ in 0..n {
+            let seq = c.u64()?;
+            let len = c.u32()? as usize;
+            unacked.insert(seq, c.take(len)?.to_vec());
+        }
+        (c.0.is_empty() && next_seq >= 1).then_some(Outbox { next_seq, unacked })
+    }
+
     /// How many messages are still awaiting acknowledgement. Exposed for
     /// tests / observability.
     pub fn pending_count(&self) -> usize {
         self.unacked.len()
+    }
+}
+
+/// Bounds-checked reader for the state encodings below. Every method
+/// returns `None` instead of panicking on short input.
+struct Cursor<'a>(&'a [u8]);
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.0.len() < n {
+            return None;
+        }
+        let (h, t) = self.0.split_at(n);
+        self.0 = t;
+        Some(h)
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
     }
 }
 
@@ -132,7 +194,10 @@ pub struct Inbox {
 
 impl Inbox {
     pub fn new() -> Self {
-        Inbox { expected_next: 1, buffered: HashMap::new() }
+        Inbox {
+            expected_next: 1,
+            buffered: HashMap::new(),
+        }
     }
 
     /// Record an incoming message. Returns the list of payloads (in order)
@@ -163,6 +228,38 @@ impl Inbox {
             self.buffered.insert(seq, payload);
             Vec::new()
         }
+    }
+
+    /// Serialize (for the session state file).
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.expected_next.to_be_bytes());
+        let mut keys: Vec<_> = self.buffered.keys().copied().collect();
+        keys.sort_unstable();
+        out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+        for k in keys {
+            let blob = &self.buffered[&k];
+            out.extend_from_slice(&k.to_be_bytes());
+            out.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+            out.extend_from_slice(blob);
+        }
+        out
+    }
+
+    pub(crate) fn from_bytes(b: &[u8]) -> Option<Inbox> {
+        let mut c = Cursor(b);
+        let expected_next = c.u64()?;
+        let n = c.u32()?;
+        let mut buffered = HashMap::new();
+        for _ in 0..n {
+            let seq = c.u64()?;
+            let len = c.u32()? as usize;
+            buffered.insert(seq, c.take(len)?.to_vec());
+        }
+        (c.0.is_empty() && expected_next >= 1).then_some(Inbox {
+            expected_next,
+            buffered,
+        })
     }
 
     /// The highest sequence number that has been fully, contiguously
