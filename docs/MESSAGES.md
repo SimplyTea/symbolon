@@ -90,5 +90,5 @@ deleted message, and whether to show per-author or merged history. See
 
 ## Related
 
-[Groups](GROUPS.md) · [Ordering](ORDERING.md) · [Bots](BOTS.md) ·
-[Threat model](THREAT_MODEL.md)
+[Wire format](WIRE_FORMAT.md) · [Groups](GROUPS.md) · [Ordering](ORDERING.md) ·
+[Bots](BOTS.md) · [Threat model](THREAT_MODEL.md)

@@ -25,6 +25,15 @@ Content is the easy part. **Metadata** is who talks to whom, when, how much.
 
 - A network observer sees who connects to whom (IP addresses), when, and
   roughly how large messages are. We do not hide that, and do not pad sizes.
+- **Identities are visible in the handshake.** Both Ed25519 public keys, the
+  version and the epochs are sent unencrypted in the first two handshake
+  messages ([Wire format](WIRE_FORMAT.md#3-layer-2-the-handshake-the-only-unencrypted-part)).
+  Anyone watching the network can therefore see *which identities* connect to
+  each other, not just which IP addresses. The oracle fix alone does not remove
+  this; a handshake that encrypts the identities after the ephemeral exchange
+  would (see [Plan](PLAN.md)).
+- Frame length prefixes, the channel byte and sequence numbers are visible too,
+  so message sizes and counts leak ([Wire format](WIRE_FORMAT.md#8-what-an-eavesdropper-sees)).
 - Idle heartbeats only occur during silence, which shows when two peers are
   *not* talking; they are encrypted but their timing is visible.
 - Group members learn the full member list. Membership is not hidden from
@@ -65,4 +74,4 @@ Content is the easy part. **Metadata** is who talks to whom, when, how much.
 
 ## Related
 
-[Library vs app](LIBRARY_VS_APP.md) · [Future crypto](FUTURE_CRYPTO.md)
+[Wire format](WIRE_FORMAT.md) · [Library vs app](LIBRARY_VS_APP.md) · [Future crypto](FUTURE_CRYPTO.md)

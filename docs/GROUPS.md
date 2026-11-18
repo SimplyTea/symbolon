@@ -65,5 +65,5 @@ tier, and how to explain "you were removed". See
 
 ## Related
 
-[Messages](MESSAGES.md) · [Bots](BOTS.md) · [Ordering](ORDERING.md) ·
+[Wire format](WIRE_FORMAT.md) · [Messages](MESSAGES.md) · [Bots](BOTS.md) · [Ordering](ORDERING.md) ·
 [Future crypto](FUTURE_CRYPTO.md) · [Sessions](SESSIONS.md)

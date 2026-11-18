@@ -24,6 +24,11 @@ compatible versions of the protocol.
    wrong machine it stops before sending its final message, so the wrong
    machine never attaches a session. (Found in the first LAN test and fixed.)
 
+The exact bytes of each message, with sizes and the reason for every field, are
+in [Wire format](WIRE_FORMAT.md). One thing to know now: the identity keys in
+the first two messages are sent **unencrypted**, so a network observer can see
+which identities connect.
+
 Because keys are ephemeral, stealing a long-term key later does not reveal past
 traffic. That property is **forward secrecy**.
 
@@ -72,5 +77,5 @@ newer version. The library reports `VersionMismatch{ours, theirs}`.
 
 ## Related
 
-[Identity and trust](IDENTITY_AND_TRUST.md) · [Sessions](SESSIONS.md) ·
+[Wire format](WIRE_FORMAT.md) · [Identity and trust](IDENTITY_AND_TRUST.md) · [Sessions](SESSIONS.md) ·
 [Future crypto](FUTURE_CRYPTO.md) · [Threat model](THREAT_MODEL.md)

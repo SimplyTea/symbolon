@@ -269,3 +269,12 @@ ordered (see the conversation notes) before any TreeKEM code.
 - Not exercised here: a real blackholed address (the sandbox answers "refused" at once), so the timeout path itself is untested.
 - Duplicate send on attach: NOT done (not reproduced yet).
 - Kept a 0.1.0 source tarball and linux-x86_64 binary in outputs for old-vs-new tests.
+
+## 2026-11-17 wire format doc
+- NEW docs/WIRE_FORMAT.md + examples/wire_dump.rs (captures a real TCP session through a recording proxy, a ratchet pair,
+  and every group/control/file/beacon layout; Walker asserts each layout covers every byte). Re-run after ANY wire change.
+- Measured: data overhead below the group layer = 85 bytes (4 prefix + 9 channel/seq + 16 transport tag + 40 ratchet header + 16 ratchet tag).
+  A group post of 11 bytes of text = 195 byte group msg = 280 bytes on the wire.
+- FINDINGS: (1) both Ed25519 identity keys, version and epochs are sent UNENCRYPTED in handshake Msg1/Msg2, so an observer sees which
+  identities connect (added to THREAT_MODEL and PLAN; fix belongs with the PQ handshake). (2) peer/author/group ids are 64 ASCII hex chars on
+  the wire (2x the raw 32 bytes). Candidate for the same format break. Neither is decided.

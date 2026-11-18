@@ -97,5 +97,5 @@ unlimited; deciding retention is the app's job. See
 
 ## Related
 
-[Handshake](HANDSHAKE_AND_VERSIONING.md) · [Groups](GROUPS.md) ·
+[Wire format](WIRE_FORMAT.md) · [Handshake](HANDSHAKE_AND_VERSIONING.md) · [Groups](GROUPS.md) ·
 [Storage](STORAGE_AND_PLUGINS.md) · [Threat model](THREAT_MODEL.md)

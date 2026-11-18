@@ -76,6 +76,43 @@ A Diffie-Hellman key exchange: two sides each send a public value and both
 compute the same secret that an eavesdropper cannot. See
 [Handshake](HANDSHAKE_AND_VERSIONING.md).
 
+## Wire-format words
+
+See [Wire format](WIRE_FORMAT.md) for all of these in context.
+
+**Big-endian**
+Writing a multi-byte number with its most significant byte first, so every
+machine reads it the same way. All numbers on the wire use it.
+
+**Channel**
+One byte in each transport message: 0 = Data, 1 = Control. Keeps the two
+streams' counters from ever producing the same nonce.
+
+**Domain separation**
+Putting a unique label (like `symbolon/handshake/v2`) into everything that is
+hashed or signed, so a signature made for one purpose cannot be reused for
+another.
+
+**Frame**
+One length-prefixed message on the TCP stream. The unit everything else is
+wrapped in.
+
+**Hash chain**
+Each item contains the hash of the one before, so changing anything old
+changes every later hash. Used for the roster and for each author's messages.
+
+**Length prefix**
+A number at the start saying how many bytes follow.
+
+**Tag (authentication tag)**
+The 16 extra bytes AEAD encryption adds so a reader can tell if anything was
+changed. Not to be confused with a one-byte *message tag* that names the kind
+of message.
+
+**Transcript**
+A hash of everything both sides said in the handshake. Both sign it, which
+ties the signatures to this exact conversation.
+
 ## Connection and delivery words
 
 **Ack (acknowledgement)**

@@ -37,4 +37,4 @@ another way of reaching peers. See [Library vs app](LIBRARY_VS_APP.md).
 
 ## Related
 
-[Threat model](THREAT_MODEL.md) · [Plan](PLAN.md)
+[Wire format](WIRE_FORMAT.md) (beacon bytes) · [Threat model](THREAT_MODEL.md) · [Plan](PLAN.md)

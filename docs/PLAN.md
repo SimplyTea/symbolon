@@ -23,6 +23,21 @@ and a minor-version bump, in exchange for protection from
 harvest-now-decrypt-later. The [handshake oracle](HANDSHAKE_AND_VERSIONING.md)
 fix rides along because the flow is being rewritten anyway.
 
+### Identity-hiding handshake and smaller wire format
+Found while documenting the bytes ([Wire format](WIRE_FORMAT.md)): both identity
+public keys cross the network unencrypted in the handshake, and ids are sent as
+64 ASCII characters instead of 32 raw bytes.
+- *Identity hiding* options: leave it (simple, but observers see who connects);
+  **encrypt the identities under the ephemeral key after the first exchange**
+  (like Noise or SIGMA-I handshakes: an observer sees only random-looking
+  bytes, at the cost of one more round trip or a reordered flow and a careful
+  redesign); or use a rendezvous secret (hides more, needs shared setup).
+  **Leaning:** encrypt after the ephemeral exchange, done together with the
+  post-quantum handshake and oracle fix so the handshake changes once.
+- *Wire-size* options: keep hex ids (readable); **raw 32-byte ids** (half the
+  size, minor bump); member-index ids (smallest, but unreadable without the
+  roster). **Leaning:** raw ids, in the same format break. Not decided.
+
 ### Tree-based groups (MLS-style)
 Options: full mesh (today), sender keys, MLS/TreeKEM, server fan-out; see
 [Groups](GROUPS.md) and [Future crypto](FUTURE_CRYPTO.md). **Plan:** tree-based.

@@ -60,5 +60,5 @@ history limits default to **unlimited**; trimming is the app's job. See
 
 ## Related
 
-[Sessions](SESSIONS.md) · [Identity](IDENTITY_AND_TRUST.md) ·
+[Wire format](WIRE_FORMAT.md) (file layouts) · [Sessions](SESSIONS.md) · [Identity](IDENTITY_AND_TRUST.md) ·
 [Threat model](THREAT_MODEL.md)

@@ -25,6 +25,7 @@ audited**; do not protect anything important with it yet
 |---|---|
 | [Identity and trust](docs/IDENTITY_AND_TRUST.md) | Who is who without a server? Why pinning, not TOFU or a CA? |
 | [Handshake and versioning](docs/HANDSHAKE_AND_VERSIONING.md) | How two peers prove themselves; what happens if versions differ; the oracle |
+| [Wire format](docs/WIRE_FORMAT.md) | Every byte on the wire and on disk: field sizes, types, the reason for each, real hex dumps, what an eavesdropper sees |
 | [Sessions](docs/SESSIONS.md) | Encryption layers, the Double Ratchet, reliable delivery, heartbeat, surviving restarts |
 | [Groups](docs/GROUPS.md) | Signed roster, tiers, group type, full mesh versus tree versus sender keys |
 | [Messages](docs/MESSAGES.md) | Author chains, relay policy, existence notices, receipts, `Have` forwarding |
@@ -110,6 +111,7 @@ Run it with `cargo run --example two_peers`. For groups see
 ```
 cargo test                       # 207 tests: unit plus real-TCP integration
 cargo run --release --example bench > bench.csv   # per-operation CPU costs
+cargo run --example wire_dump    # real bytes of every message, field by field
 ```
 
 Integration tests cover tampering, disconnect and resume, restart, heartbeat,
