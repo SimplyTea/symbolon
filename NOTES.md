@@ -278,3 +278,145 @@ ordered (see the conversation notes) before any TreeKEM code.
 - FINDINGS: (1) both Ed25519 identity keys, version and epochs are sent UNENCRYPTED in handshake Msg1/Msg2, so an observer sees which
   identities connect (added to THREAT_MODEL and PLAN; fix belongs with the PQ handshake). (2) peer/author/group ids are 64 ASCII hex chars on
   the wire (2x the raw 32 bytes). Candidate for the same format break. Neither is decided.
+
+## 2026-11-18 clippy, e2e scripts, two real bugs found by a flaky test
+- scripts/e2e/: 8 real-process scripts + run_all.sh (a script passes only if exit 0, no FAIL line, at least one PASS line;
+  most scripts print PASS/FAIL rather than setting an exit code).
+- Clippy clean (allow() with reasons on Reconnected size and two 8-arg internal fns); cargo fmt applied.
+- forward_test was flaky (about 1 in 3 on a 2-core box; passed earlier by luck). Two REAL bugs:
+  1. Duplicate copy (author's own + a Have-prompted fetch) was reported as a "chain violation" rejection. Now: identical content =
+     GroupMessageDuplicate (ignored); different content under a held seq = rejected as conflict (equivocation). 2 new unit tests.
+  2. Lost wake-up: a Have inside the 300 ms request window was DROPPED, so the last announcement could stall forever. Now one
+     event-triggered follow-up per author asks for the HIGHEST announced seq (first version used the first seq: still stalled 1/26).
+  Verified: 70 runs sequential + 30 under parallel load, 0 failures. Tests: 209.
+
+## 2026-11-18 duplicate send on attach: analysis so far (PAUSED, not fixed)
+- Cause (from reading session.rs; NOT yet reproduced by a test): every new connection, including a brand-new session, makes BOTH
+  sides send a ResumeRequest (we saw control seq 1 = 9-byte plaintext in wire_dump). The peer's ResumeRequest handler resends
+  `outbox.messages_after(last_contiguous)`. If the app already send()-wrote a message in the first round trip, that message is
+  still unacked, so it goes out twice (original write + "Retransmitted"). Receiver's inbox drops the duplicate; same key, same
+  nonce, same plaintext => identical bytes, so no secrecy harm, just wasted frames and a Retransmitted trace event.
+- Planned repro: memory_pair with ~50 ms latency, A sends right after establish, tracer must show no Retransmitted on a fresh link.
+- Planned fix: `resend_ceiling` = highest outbox seq at the moment the current connection began (captured AFTER swapping
+  write_stream, line ~677; set from the restored outbox on state restore). ResumeRequest resends only seq <= ceiling. Messages
+  stored after the swap are written by send() on the new link. A message stored before the capture but written after the swap is
+  at worst sent twice, never lost. Do NOT use "skip if written on this link" without that ordering: a send stored after capture but
+  written to the old dead link would never be retransmitted. Keep the Ack(missing) retransmit path unchanged.
+
+## 2026-11-19 duplicate send on attach: FIXED
+- Reproduced with tests/resume_dup_test.rs (memory_pair, 50 ms latency, send right after establish): before the fix the tracer showed
+  `MessageQueued{1}` then `Retransmitted{count:1}` on a fresh link; after, no Retransmitted.
+- Fix: `Outbox::highest_seq()`; `Session.resend_ceiling` (AtomicU64) seeded from the (restored) outbox in from_handshake and re-captured in
+  reconnect AFTER the write_stream swap; the ResumeRequest handler retains only seq <= ceiling. Ack(missing) retransmit path unchanged.
+- Verified: 210 tests pass, clippy clean, 8 e2e scripts pass (use an ABSOLUTE SYMBOLON_BIN path). Docs: SESSIONS.md section 3, PLAN backlog.
+- Presentation: Slides artifact built (Hack and Tell), 19+ slides with exchange-band and packing diagrams and sketch snippets.
+
+## 2026-11-19 0.3.0 step 1: identity-hiding handshake (BUILT)
+- New flow (5 frames): Msg1/Msg2 = bare ephemeral X25519 keys (32 B each); handshake keys = HKDF(salt = H("symbolon/handshake/v3/eph" ||
+  epub_i || epub_r), shared); Msg3 (I->R) and Msg4 (R->I) = AEAD{version(6) idpub(32) epoch(16) sig(64)} (134 B each incl. tag);
+  Msg5 (I->R) = AEAD(empty) with the full transcript as AAD. Responder replies (Msg4) ONLY after the initiator proved its key AND is pinned.
+- Initiator signs H("symbolon/handshake/v3/initiator" || epubs || version_i || idpub_i || epoch_i); responder signs the FULL transcript
+  (includes sig_i). Session keys + ratchet seed derive from (shared, full transcript) as before.
+- Why Msg5: first version had no confirmation; dialling a wrong machine left a half-open session on it (bot_wrong_addr e2e caught it).
+  New unit test dialling_the_wrong_machine_leaves_no_session_on_that_machine.
+- Only keys that SIGNED are recorded for approval (stranger cannot flood the queue). Old 86-byte Msg1 gets a clear VersionMismatch (logged).
+- Known limit: an ACTIVE MITM learns the DIALLER's identity (it speaks first); listener's stays hidden. Fix would need the listener's key known in
+  advance (Noise IK). Version mismatch now only visible to the listener (dialler sees closed connection).
+- Crate is 0.3.0. 215 tests, 8 e2e pass, wire_dump updated ("All layouts matched the bytes").
+- DECISIONS (Tea): expiry field NOT in the header (disappearing messages = app/add-on, maybe a later wire change); flags byte on HOLD (may
+  need TLV-style options if app-type headers come); padding optional default off; raw ids + ml-kem still to do in 0.3.0.
+- TODO next in 0.3.0: raw 32-byte PeerId type; hybrid ML-KEM-768 (approved crate: ml-kem, builds on 1.97); optional padding.
+
+## 2026-11-20 0.3.0 step 2: raw 32-byte ids (BUILT)
+- New src/ids.rs: PeerId / GroupId newtypes ([u8;32], Copy). Wire carries raw bytes (no u16 length, no hex); hex only in Display/Debug/CLI.
+- Saved session state SYMS format 2 (raw peer id). Signed/hashed group data now uses raw ids.
+- 11-byte post: 195 -> 161 byte group message; 280 -> 246 bytes on the wire. Delete 190, Receipt 170, Have 41, Roster(genesis, 2 members) 276.
+- 217 tests pass, clippy clean (after removing clone-on-Copy and unused hex_encode), wire_dump matches all layouts.
+- Docs updated: WIRE_FORMAT (sections 1, 6, 9), PLAN.
+- Remaining in 0.3.0: hybrid X25519 + ML-KEM-768 (ml-kem crate), optional padding (default off).
+- Tea asked: handshake size and comparison with Signal. Correct number: ML-KEM-768 adds ~2.3 KB once per connection
+  (1184 B encapsulation key + 1088 B ciphertext); per-message overhead unchanged (85 B).
+
+## 2026-11-20 roadmap discussion
+- Added "Roadmap by release" to docs/PLAN.md. Transports (TCP/UDP-style choice, possibly both listening) planned ~1.2.0 as add-ons;
+  library already runs over any reliable ordered stream, so apps can attach other streams today. Raw UDP is not such a stream.
+- PQ ratchet / re-handshake / ML-DSA -> 1.0.0. Voice -> post-1.0.0 add-on.
+- ml-kem dependency line already added to Cargo.toml (Cargo.lock changed), NOT yet used. Handshake work starts next session.
+
+## 2026-11-20 file sending design (agreed, not built; planned 0.4.0)
+- Offer = new content kind in the signed application message: optional name, u64 size, whole-file hash (Merkle root), 512-byte prefix (optional).
+- Receiver-driven: library raises FileOffered event; app calls accept_file(offer, writer) / decline_file(offer). Default policy = always ask; decline is local and silent.
+- Chunks 256 KiB, Merkle-verified, windowed (a few in flight), resumable, streamed to temp file then renamed after hash check. New group tags FileRequest/FileChunk.
+- Default cap 1 GiB, configurable, higher hard cap; reject sender that exceeds declared size. Magic bytes are a claim: verify prefix against received file; no file-type database in core.
+- Test binary: y/n prompt plus --auto-accept / --auto-deny flags for e2e scripts and bots.
+- Open: files in 1:1 chats as well as groups (leaning: one mechanism for both).
+
+## 2026-11-20 0.3.0 step 3: hybrid X25519 + ML-KEM-768 handshake (BUILT)
+- Crate: ml-kem 0.3.4 (RustCrypto; its README says NOT independently audited; noted in THREAT_MODEL). Features getrandom + zeroize.
+  Needed `cargo update -p zeroize` and a direct `zeroize = "1.8"` dependency; dropped the old zeroize/zeroize_derive exact pins
+  (ml-kem needs Rust 1.85+ anyway, so the pins for old compilers no longer help).
+- Msg1 = epub_i (32) || ML-KEM encapsulation key (1184) = 1216; Msg2 = epub_r (32) || ciphertext (1088) = 1120.
+  eph = SHA-256("symbolon/handshake/v4/eph" || Msg1 || Msg2) salts the combiner and is bound into both signatures (labels now v4).
+  combined = HKDF(salt = eph, ikm = ss_mlkem || ss_x25519, info "symbolon/hybrid/v1 x25519+ml-kem-768"); it replaces the raw DH secret everywhere
+  (handshake keys, session keys, ratchet seed). Msg3/Msg4 are therefore protected by the PQ secret too.
+- Measured: handshake = 2640 bytes in 5 frames (was 368); +2272 once per connection; per-message overhead unchanged (85 B).
+- Responder validates the ML-KEM key (FIPS 203 modulus check) before replying; a 32-byte (pre-hybrid draft) first message gets MalformedMessage;
+  86-byte 0.2 message still gets VersionMismatch. ML-KEM implicit rejection means a tampered ciphertext shows up as a failed Msg3 decrypt.
+- 7 new tests (sizes, combiner needs both inputs, tampered ciphertext, tampered X25519 half, control run, malformed key, old 32-byte msg1).
+  224 tests pass, clippy clean, wire_dump matches.
+- Docs: WIRE_FORMAT section 3, HANDSHAKE_AND_VERSIONING, THREAT_MODEL (new Post-quantum status table), FUTURE_CRYPTO, PLAN, README.
+- Decided with Tea: PQ ratchet / periodic re-handshake / ML-DSA wait for 1.0.0. Any tree group design must be PQ from day one
+  (hybrid KEM at nodes, or a secret mixed in from the pairwise hybrid sessions).
+- Remaining in 0.3.0: optional padding (default off, selectable block sizes). Then file sending (0.4.0).
+
+## 2026-11-21 0.3.0 step 4: optional padding (BUILT) — 0.3.0 bundle complete
+- New src/padding.rs: `Padding` (OFF default, STANDARD 256, STRONG 1024, `Padding::block(16..=65535)`), `pad()` / `unpad()`.
+  Scheme: payload || 0x80 || zeros up to a multiple of the block. Receiver ALWAYS unpads (drop trailing zeros, require 0x80),
+  so no setting, flag or negotiation is needed and each side pads only what it sends. Marker is always present: padding off costs exactly 1 byte/message.
+- Wired in Session::send (pad before ratchet encrypt) and the reader thread (unpad right after decrypt, before the saved queue).
+  `SessionConfig.padding`, `Session::set_padding()` / `padding()` (atomic, changeable at runtime). New `ChatError::InvalidConfig`.
+- CLI: `--padding off|standard|strong|BYTES`. New e2e script scripts/e2e/padding_e2e.py (one side padded, one not), added to run_all.sh.
+- Fixed overhead below the group layer is now 86 bytes (85 + marker). 11-byte "hello group" post: 247 bytes on the wire off, 341 with Standard.
+- 14 new tests (8 unit in padding.rs, 6 in tests/padding_test.rs that record real frame sizes). 238 tests total, clippy clean, wire_dump matches.
+- Docs: WIRE_FORMAT 5.1 plus updated numbers, THREAT_MODEL metadata, PLAN, README.
+- Padding does not hide timing, message counts or the Data/Control channel byte.
+- NEXT: file sending (0.4.0), a key-derivation API for add-ons, demo app. Open: files in 1:1 chats too (leaning yes, one mechanism).
+
+## 2026-11-22 0.4.0 file sending, stage 1: core module (BUILT)
+- Tea decided: default size limit 1 GiB (configurable, hard max 4 GiB); files in 1:1 chats too, one mechanism for both.
+- New src/file.rs (+ docs/FILES.md): FileOffer (optional name, u64 size, chunk size, root, 512-byte prefix), Manifest (flat list of per-chunk
+  hashes, NOT a Merkle tree: receiver always fetches the whole list first, so per-chunk proofs buy nothing; rationale in FILES.md),
+  prepare(), ChunkSource (FileSource, MemorySource), FileServer (re-verifies each chunk so a file changed on disk is not served),
+  FileSink (PartFileSink writes <name>.part and renames when complete, never overwrites), FileReceiver (windowed requests, any order,
+  duplicates ignored, bad chunk rejected unwritten, prefix lie caught on chunk 0, save/restore of verified chunks), FileFrame (5 messages),
+  sanitize_name. New ChatError::FileTransfer. Constants: chunk 256 KiB default (16 KiB..1 MiB), max 65536 chunks, prefix 512, window requests <= 64.
+- Root = SHA-256("symbolon/file/root/v1" || size || chunk_size || all leaf hashes); leaf = SHA-256("symbolon/file/leaf/v1" || chunk).
+- Measured (256 MiB in memory): prepare 1.1 GiB/s, serve+verify+write 0.6 GiB/s.
+- 19 new tests; 257 total, clippy clean. Not yet wired into sessions/groups/CLI; no wire format section yet (added with the wiring).
+- NEXT (stage 2): group wiring (content kind for the offer, tags 0x18+ for requests/chunks, author-first then holders, only members may request);
+  stage 3: 1:1 envelope so a Session can carry text and file messages (decide how; current 1:1 payloads are raw app bytes);
+  stage 4: hub/session events + accept_file/decline_file, policy hook, CLI y/n and --auto-accept/--auto-deny, e2e script.
+
+## 2026-11-22 file transfer: security fix, full checks list, number theory / quantum note
+- FOUND WHILE LISTING CHECKS: PartFileSink::create truncated an existing `<name>.part` (would follow a planted symlink) and finish() used rename
+  (silently replaces a file that appeared meanwhile). FIXED: `.part` is created with create_new (refuses anything existing, incl. symlinks); finish()
+  uses hard_link (fails if destination exists) with a check-then-rename fallback; new `PartFileSink::resume` (plain file of exact size, no links).
+  3 new tests (mid-download destination, stale part + resume, symlink on unix). 22 file tests, 260 total.
+- docs/FILES.md: complete numbered list of every check (44 built, grouped), planned checks for the wiring stage, and known gaps.
+  docs/THREAT_MODEL.md: new "File transfer" and "Number theory, Riemann and quantum algorithms" sections; FUTURE_CRYPTO points at it.
+- Riemann news (as reported 22 Nov 2026): two claimed proofs (Anthropic number theorist + Claude with Lean code; Stanford postdoc, no AI).
+  UNVERIFIED, no peer review. Conclusion recorded: RH does not affect any primitive we use (we use fixed standardized parameters, ECDLP / lattice / hash);
+  Shor does (Ed25519 + X25519), and Google Quantum AI's reported estimate (<1200 logical, <500k physical qubits for ECDLP-256) is a reason to keep
+  the 1.0.0 hybrid-signature work on schedule.
+- Tea asked about "device support": multi-device was decided SKIPPED (home-node/bouncer idea only); laptop + Raspberry Pi runs are done (LAN tested).
+
+## Stage 2 of file sending: wired into groups (269 tests)
+
+- Offer = content kind 3 in the signed author chain; bytes = group tag 0x18 carrying a `FileFrame`. New module `src/group/files.rs` (child of `group` so it can use hub state).
+- API: `offer_file`, `accept_file`, `decline_file`, `try_another_source`, `serve_file`, `file_offer`. Events: `FileOffered`, `FileProgress`, `FileComplete`, `FileFailed`. Config: `max_file_size` (1 GiB), `max_concurrent_downloads` (4).
+- Author first, then other connected readers; AuthorOnly groups: author only. Non-readers get no answer (mutation-checked: removing the check fails the test).
+- Caught while writing: a `cargo fmt` reformat made two scripted edits silently not apply (the AuthorOnly guard in `serve_file`); the new AuthorOnly test caught it. Lesson: verify scripted edits landed.
+- In AuthorOnly groups a relaying member sends only an existence notice, so a member not linked to the author never sees the offer. That is the policy working, not a bug.
+- Known gaps recorded in docs/FILES.md: no stall timer (app calls `try_another_source`), disk reads on the processing thread, no resume across restarts.
+- Multi-device (device certificates, after 1.0) moved from Parked to Planned in docs/PLAN.md.
+- Next: stage 3 (1:1 envelope; options to Tea first), then stage 4 (app calls, CLI y/n, `--auto-accept`/`--auto-deny`, e2e).

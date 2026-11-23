@@ -116,6 +116,14 @@ impl Outbox {
     /// Undo [`Outbox::reserve_seq`] + [`Outbox::store`] for `seq`, which
     /// must be the most recently reserved number. Used when persisting the
     /// new state failed and the send is being abandoned.
+    /// The highest sequence number handed out so far (0 if none yet).
+    /// A session records this when a connection begins, so a resume
+    /// request only replays messages that existed BEFORE the link was
+    /// up: anything stored afterwards is written by `send()` itself.
+    pub fn highest_seq(&self) -> u64 {
+        self.next_seq - 1
+    }
+
     pub fn rollback(&mut self, seq: u64) {
         self.unacked.remove(&seq);
         if self.next_seq == seq + 1 {

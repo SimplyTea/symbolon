@@ -12,22 +12,45 @@ compatible versions of the protocol.
 
 ## How it works here
 
-1. Each side generates an **ephemeral** X25519 key and a random 16-byte epoch.
-2. They exchange these plus their identity public keys and versions.
-3. Each side signs a *transcript* (a hash of everything said so far: versions,
-   identities, ephemeral keys, epochs) with its Ed25519 identity key. Because
-   the signature covers everything, an attacker cannot swap pieces between
-   conversations or downgrade anything undetected.
-4. From the shared X25519 secret, **HKDF** derives separate keys for each
+1. Each side contributes key material for a **hybrid** exchange: an
+   **ephemeral** X25519 key from each side, plus ML-KEM-768 (the standardized
+   post-quantum KEM, formerly Kyber). The initiator sends its X25519 key and an
+   ML-KEM public key (Msg1); the responder answers with its X25519 key and an
+   ML-KEM ciphertext (Msg2). Nobody has said who they are yet.
+2. Both compute the same two secrets and mix them into one (HKDF), then derive
+   **handshake keys** from it. An eavesdropper has seen only public halves, and
+   would need to break **both** X25519 and ML-KEM to recover the secret. That is
+   what protects a recording against a future quantum computer ("harvest now,
+   decrypt later").
+3. The initiator sends, **encrypted**, its version, identity key, a random
+   16-byte epoch and a signature (Msg3). The responder checks that the caller
+   really holds the key it names, and then that the key is pinned. If not, it
+   closes without a word.
+4. Only then does the responder send its own version, identity key, epoch and
+   signature, encrypted (Msg4). The signature covers a *transcript*: a hash of
+   everything said, including the initiator's signature. An attacker cannot
+   swap pieces between conversations or downgrade anything undetected.
+5. The initiator checks everything and sends a tiny encrypted confirmation
+   (Msg5). The responder creates a session only when it arrives.
+6. From the shared secret, **HKDF** derives separate session keys for each
    direction. Those seed the [Double Ratchet](SESSIONS.md).
-5. The initiator only trusts the peer it *meant* to dial. If it reaches the
-   wrong machine it stops before sending its final message, so the wrong
-   machine never attaches a session. (Found in the first LAN test and fixed.)
+7. The initiator only trusts the peer it *meant* to dial. If it reaches the
+   wrong machine it stops before Msg5, so the wrong machine never attaches a
+   session.
+   (Found in the first LAN test and fixed.)
+
+This is the same idea TLS 1.3 uses (it exchanges key shares first and sends the
+certificates encrypted), and Noise-style handshakes work the same way.
 
 The exact bytes of each message, with sizes and the reason for every field, are
-in [Wire format](WIRE_FORMAT.md). One thing to know now: the identity keys in
-the first two messages are sent **unencrypted**, so a network observer can see
-which identities connect.
+in [Wire format](WIRE_FORMAT.md). The post-quantum half costs 2272 bytes once
+per connection (1184 + 1088); messages after the handshake are unchanged. Who can
+see what: a passive observer sees two blocks of random-looking key material and
+two encrypted blobs, so **no identity, version or
+epoch**. An active attacker who intercepts the exchange learns the *dialler's*
+identity (it speaks first) but cannot authenticate and never learns the
+listener's. Hiding the dialler from active attackers too would need the
+listener's key known in advance (as in Noise IK); not done yet.
 
 Because keys are ephemeral, stealing a long-term key later does not reveal past
 traffic. That property is **forward secrecy**.
@@ -55,20 +78,23 @@ We chose the single number plus strict equality of major.minor. The cost is
 that two friends on 0.1 and 0.2 cannot talk until one upgrades. For an
 unreleased security library, a loud failure beats a quiet downgrade.
 
-## The "oracle" (known, low priority)
+## The "oracle" (fixed in 0.3.0)
 
-A node that holds a trusted key and probes another node can learn that the
-other node exists, which identity answers, that its signature verifies, and
-which version it runs. That means a handshake can reveal that **two nodes may
-know each other**. It does not reveal message content or who else is in a
-group.
+In 0.2 a node that held a trusted key could probe another node and learn that
+it exists, which identity answers, that its signature verifies, and which
+version it runs. That meant a handshake could reveal that **two nodes may know
+each other**.
 
-Options: leave it (cheap, a small metadata leak), or redesign the handshake so
-the responder reveals nothing until the initiator has proved knowledge of a
-shared secret first (stronger, but it changes the message flow). We decided to
-**bundle the fix with the post-quantum handshake**, since that handshake is
-being redesigned anyway. See [Future crypto](FUTURE_CRYPTO.md) and
-[Plan](PLAN.md).
+Now the responder reveals nothing until the caller has proved it holds a key
+the responder has pinned. An unknown caller, a stranger probing, or a caller
+with a bad signature all get the same thing: a bare ephemeral key (which says
+nothing), then silence. A caller that proved its key but is not yet pinned is
+recorded for approval, so you can still approve a new friend. Keys that did
+not sign are never recorded, so a stranger cannot flood the approval list.
+
+Trade-off: on a version mismatch the dialler can no longer be told why. The
+listener refuses silently and logs both versions; the dialler just sees the
+connection close.
 
 ## What the app handles
 

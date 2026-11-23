@@ -49,6 +49,16 @@ the receiver **acks** it. The receiver keeps an **inbox** that notices gaps and
 delivers strictly in order. After a disconnect the two sides compare what they
 have and resend exactly what is missing (`reliability.rs`).
 
+Every new connection, even a brand-new session, makes both sides send a
+**resume request** ("I have everything up to N"). A message the app sends in
+the first round trip would otherwise be written once by `send()` and again as a
+"replay" when the peer's request arrives. To avoid that waste, a session notes
+the highest sequence number that existed when the link began (the *resend
+ceiling*) and replays only up to it; anything stored later is written by
+`send()` on the new link. The ceiling is taken after the writer is swapped, so
+a message can at worst be sent twice, never zero times. Duplicates that do
+still occur are dropped by the inbox.
+
 Reconnect outcomes are explicit: `Reconnected::Resumed` (same conversation
 continued) or `Reconnected::Replaced` (the other side restarted without state;
 you start a new conversation). A reconnect from the wrong identity yields

@@ -17,10 +17,14 @@ signature needs the computer at the time of the connection.
 |---|---|---|
 | Do nothing | Nothing to build | Recorded traffic becomes readable |
 | PQ-only key exchange (ML-KEM alone) | Simple story | ML-KEM is newer; if a flaw is found you have nothing |
-| **Hybrid: X25519 + ML-KEM-768 together** (**planned**) | Safe if *either* holds; same approach as Signal and browsers | About 1 KB extra per handshake; more code; a new wire format (minor bump) |
+| **Hybrid: X25519 + ML-KEM-768 together** (**BUILT in 0.3.0**) | Safe if *either* holds; same approach as Signal and browsers | 2272 bytes extra per handshake (1184-byte key + 1088-byte ciphertext), once per connection; more code; a new wire format (minor bump) |
 | Hybrid signatures too (Ed25519 + ML-DSA) | Protects identity from quantum forgery | Large keys and signatures (kilobytes); later |
 
-**Plan.** Hybrid key exchange first, signatures later. Bundled with it: the
+**Plan.** Hybrid key exchange first (done), signatures later (1.0.0). Recent
+reports of falling quantum resource estimates are a reason not to let the
+signature work slip; see
+[Number theory, Riemann and quantum algorithms](THREAT_MODEL.md#number-theory-riemann-and-quantum-algorithms)
+for what does and does not affect us (the Riemann Hypothesis does not). Bundled with it: the
 handshake oracle fix ([Handshake](HANDSHAKE_AND_VERSIONING.md)), since that
 handshake gets redesigned anyway. Constraint: the implementation must stay a
 small dependency, in keeping with the "library not framework" rule.

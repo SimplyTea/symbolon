@@ -42,7 +42,13 @@ fn main() {
 
     // 4. Send and receive. Messages are encrypted, ordered and acknowledged.
     alice_session.send(b"hello bob").unwrap();
-    println!("bob got: {}", String::from_utf8_lossy(&bob_session.recv().unwrap()));
+    println!(
+        "bob got: {}",
+        String::from_utf8_lossy(&bob_session.recv().unwrap())
+    );
     bob_session.send(b"hello alice").unwrap();
-    println!("alice got: {}", String::from_utf8_lossy(&alice_session.recv().unwrap()));
+    println!(
+        "alice got: {}",
+        String::from_utf8_lossy(&alice_session.recv().unwrap())
+    );
 }

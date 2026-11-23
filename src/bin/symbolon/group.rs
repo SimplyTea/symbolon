@@ -41,7 +41,7 @@ use symbolon::group::{
     GroupEvent, GroupHub, GroupHubConfig, GroupMessage, MemberKind, Roster, RosterOpWire,
 };
 use symbolon::identity::{
-    decode_public_key, encode_public_key, fingerprint, Identity, PeerRegistry,
+    decode_public_key, encode_public_key, fingerprint, Identity, PeerId, PeerRegistry,
 };
 use symbolon::session::{Role, Session, SessionConfig};
 
@@ -99,7 +99,7 @@ fn to_hex(bytes: &[u8]) -> String {
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 || !s.is_ascii() {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
     (0..s.len())
@@ -220,10 +220,10 @@ pub fn group_new(args: &[String]) {
 }
 
 /// Build a registry that accepts exactly the group's other members.
-fn registry_for(keys: &[ed25519_dalek::VerifyingKey], own: &str) -> PeerRegistry {
+fn registry_for(keys: &[ed25519_dalek::VerifyingKey], own: &PeerId) -> PeerRegistry {
     let mut r = PeerRegistry::new();
     for k in keys {
-        if fingerprint(k) != own {
+        if fingerprint(k) != *own {
             r.trust(*k);
         }
     }
@@ -232,7 +232,7 @@ fn registry_for(keys: &[ed25519_dalek::VerifyingKey], own: &str) -> PeerRegistry
 
 /// Print a one-line description of an event.
 fn show_event(ev: GroupEvent) {
-    let who = |id: &str| id.chars().take(8).collect::<String>();
+    let who = |id: &PeerId| id.short();
     match ev {
         GroupEvent::Message {
             sender,
@@ -272,6 +272,30 @@ fn show_event(ev: GroupEvent) {
             who(&author),
             who(&author)
         ),
+        GroupEvent::FileOffered { sender, seq, offer } => println!(
+            "[{} #{seq}] offers a file: {} ({} bytes)",
+            who(&sender),
+            offer.name.as_deref().unwrap_or("(no name)"),
+            offer.size
+        ),
+        GroupEvent::FileProgress {
+            author,
+            seq,
+            done,
+            total,
+        } => {
+            println!("[file {} #{seq}] {done}/{total} chunks", who(&author))
+        }
+        GroupEvent::FileComplete { author, seq } => {
+            println!("[file {} #{seq}] complete", who(&author))
+        }
+        GroupEvent::FileFailed {
+            author,
+            seq,
+            reason,
+        } => {
+            println!("[file {} #{seq}] failed: {reason}", who(&author))
+        }
     }
 }
 
@@ -279,15 +303,15 @@ fn show_event(ev: GroupEvent) {
 fn attach(
     hub: &Arc<GroupHub>,
     session: Session,
-    connected: &Arc<Mutex<HashSet<String>>>,
+    connected: &Arc<Mutex<HashSet<PeerId>>>,
 ) -> Arc<Session> {
     let peer = session.peer_id();
     let session = Arc::new(session);
-    hub.attach_session(peer.clone(), Arc::clone(&session));
-    connected.lock().unwrap().insert(peer.clone());
+    hub.attach_session(peer, Arc::clone(&session));
+    connected.lock().unwrap().insert(peer);
     eprintln!(
         "[connected] {}  (session id {})",
-        &peer[..8],
+        peer.short(),
         &session.session_id()[..16]
     );
     dlog!(
@@ -388,7 +412,7 @@ fn run_group(args: &[String], bot: bool) {
         info!(
             bot,
             "  member {}{}{}",
-            &fp[..16],
+            &fp.to_hex()[..16],
             if hub.kind_of(&fp) == Some(MemberKind::Bot) {
                 " [bot]"
             } else {
@@ -397,7 +421,7 @@ fn run_group(args: &[String], bot: bool) {
             if fp == own_fp { "  (you)" } else { "" }
         );
     }
-    let connected: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let connected: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // ---- listener: accept the members who dial us ----
     if let Some(bind) = flag(args, "--bind") {
@@ -409,7 +433,7 @@ fn run_group(args: &[String], bot: bool) {
             Arc::clone(&hub),
             Arc::clone(&identity),
             Arc::clone(&connected),
-            own_fp.clone(),
+            own_fp,
             persistence.clone(),
         );
         std::thread::spawn(move || {
@@ -418,7 +442,7 @@ fn run_group(args: &[String], bot: bool) {
                     Arc::clone(&hub),
                     Arc::clone(&identity),
                     Arc::clone(&connected),
-                    own.clone(),
+                    own,
                     persistence.clone(),
                 );
                 // One thread per incoming connection so a slow/hostile
@@ -458,7 +482,7 @@ fn run_group(args: &[String], bot: bool) {
         hub: Arc::clone(&hub),
         identity: Arc::clone(&identity),
         connected: Arc::clone(&connected),
-        own_fp: own_fp.clone(),
+        own_fp,
     };
     for spec in flag_all(args, "--peer") {
         if let Err(e) = add_peer(&ctx, &spec) {
@@ -580,6 +604,25 @@ fn show_event_tsv(ev: GroupEvent) {
             println!("receipt\t{from}\t{seq}\t{kind:?}")
         }
         GroupEvent::Existence { author, seq } => println!("exists\t{author}\t{seq}\t"),
+        GroupEvent::FileOffered { sender, seq, offer } => {
+            println!("file-offer\t{sender}\t{seq}\t{}", offer.size)
+        }
+        GroupEvent::FileProgress {
+            author,
+            seq,
+            done,
+            total,
+        } => {
+            println!("file-progress\t{author}\t{seq}\t{done}/{total}")
+        }
+        GroupEvent::FileComplete { author, seq } => println!("file-complete\t{author}\t{seq}\t"),
+        GroupEvent::FileFailed {
+            author,
+            seq,
+            reason,
+        } => {
+            println!("file-failed\t{author}\t{seq}\t{reason}")
+        }
     }
 }
 
@@ -669,12 +712,12 @@ fn bot_loop(args: &[String], ctx: &Ctx) {
 struct Ctx {
     /// Peers we already have a dial loop for. A second loop for the same
     /// peer would attach a second session and replace the first.
-    dialing: Arc<Mutex<HashSet<String>>>,
+    dialing: Arc<Mutex<HashSet<PeerId>>>,
     persistence: Option<Arc<symbolon::sessionstate::SessionPersistence>>,
     hub: Arc<GroupHub>,
     identity: Arc<Identity>,
-    connected: Arc<Mutex<HashSet<String>>>,
-    own_fp: String,
+    connected: Arc<Mutex<HashSet<PeerId>>>,
+    own_fp: PeerId,
 }
 
 /// Start dialling `KEYHEX=HOST:PORT` if WE are the side that dials (smaller
@@ -689,18 +732,18 @@ fn add_peer(ctx: &Ctx, spec: &str) -> std::result::Result<(), String> {
         return Err("that is your own key".to_string());
     }
     if !ctx.hub.is_member(&peer_fp) {
-        eprintln!("[note] {} is not in your roster yet; dialling anyway - the connection will succeed once the roster syncs]", &peer_fp[..8]);
+        eprintln!("[note] {} is not in your roster yet; dialling anyway - the connection will succeed once the roster syncs]", peer_fp.short());
     }
     if peer_fp < ctx.own_fp {
-        eprintln!("[note] {} has the smaller fingerprint, so THEY dial you; use --bind and give them your address]", &peer_fp[..8]);
+        eprintln!("[note] {} has the smaller fingerprint, so THEY dial you; use --bind and give them your address]", peer_fp.short());
         return Ok(());
     }
     // One dial loop per peer. (Repeating --peer, or /peer twice, used to start
     // two loops that each attached a session, the second replacing the first.)
-    if !ctx.dialing.lock().unwrap().insert(peer_fp.clone()) {
+    if !ctx.dialing.lock().unwrap().insert(peer_fp) {
         eprintln!(
             "[note] already dialling {}; ignoring the repeat (restart to change its address)]",
-            &peer_fp[..8]
+            peer_fp.short()
         );
         return Ok(());
     }
@@ -708,11 +751,11 @@ fn add_peer(ctx: &Ctx, spec: &str) -> std::result::Result<(), String> {
         Arc::clone(&ctx.hub),
         Arc::clone(&ctx.identity),
         Arc::clone(&ctx.connected),
-        ctx.own_fp.clone(),
+        ctx.own_fp,
         addr.to_string(),
         ctx.persistence.clone(),
     );
-    let expect_peer = peer_fp.clone();
+    let expect_peer = peer_fp;
     std::thread::spawn(move || {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -734,7 +777,7 @@ fn add_peer(ctx: &Ctx, spec: &str) -> std::result::Result<(), String> {
                         &registry,
                         SessionConfig {
                             persistence: persistence.clone(),
-                            expect_peer: Some(expect_peer.clone()),
+                            expect_peer: Some(expect_peer),
                             ..super::session_config()
                         },
                         None,
@@ -746,7 +789,7 @@ fn add_peer(ctx: &Ctx, spec: &str) -> std::result::Result<(), String> {
                             while session.link_alive() {
                                 std::thread::sleep(Duration::from_millis(500));
                             }
-                            eprintln!("[link to {} lost; redialling]", &peer_fp[..8]);
+                            eprintln!("[link to {} lost; redialling]", peer_fp.short());
                             connected.lock().unwrap().remove(&peer_fp);
                         }
                         Err(e) => {
@@ -785,16 +828,16 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
                 let link = if up.contains(&id) { " [connected]" } else { "" };
                 let bot = match hub.sponsor_of(&id) {
                     Some(s) if hub.kind_of(&id) == Some(MemberKind::Bot) => {
-                        format!(" [bot, sponsor {}]", &s[..8])
+                        format!(" [bot, sponsor {}]", s.short())
                     }
                     _ if hub.kind_of(&id) == Some(MemberKind::Bot) => " [bot]".to_string(),
                     _ => String::new(),
                 };
-                println!("  {}  tier={tier}{bot}{me}{link}", &id[..16]);
+                println!("  {}  tier={tier}{bot}{me}{link}", &id.to_hex()[..16]);
             }
         }
         "bots" => {
-            let bots: Vec<String> = hub
+            let bots: Vec<PeerId> = hub
                 .member_ids()
                 .into_iter()
                 .filter(|id| hub.kind_of(id) == Some(MemberKind::Bot))
@@ -803,10 +846,10 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
                 println!("no bots in this group");
             }
             for id in bots {
-                let sponsor = hub.sponsor_of(&id).unwrap_or_default();
+                let sponsor = hub.sponsor_of(&id).map(|s| s.to_hex()).unwrap_or_default();
                 println!(
                     "  {}  tier={}  sponsor={}",
-                    &id[..16],
+                    &id.to_hex()[..16],
                     hub.tier_of(&id).unwrap_or_default(),
                     &sponsor[..sponsor.len().min(16)]
                 );
@@ -819,7 +862,7 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
             };
             match decode_public_key(key_hex) {
                 Ok(key) => match hub.propose_add_bot(identity, key, tier.to_string()) {
-                    Ok(()) => println!("[added bot {} as {tier}; it needs the invite and a connection to any member. It is removed automatically if you leave or are removed]", &fingerprint(&key)[..8]),
+                    Ok(()) => println!("[added bot {} as {tier}; it needs the invite and a connection to any member. It is removed automatically if you leave or are removed]", fingerprint(&key).short()),
                     Err(e) => println!("[addbot failed: {e}  (the tier must exist and grant neither add nor remove; see /deftier)]"),
                 },
                 Err(e) => println!("[bad public key: {e}]"),
@@ -830,10 +873,10 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
                 println!("usage: /tier FPR-PREFIX TIERNAME   (needs add+remove; a bot can only move to bot-safe tiers)");
                 return;
             };
-            let matches: Vec<String> = hub.member_ids().into_iter().filter(|id| id.starts_with(prefix)).collect();
+            let matches: Vec<PeerId> = hub.member_ids().into_iter().filter(|id| id.to_hex().starts_with(prefix)).collect();
             match matches.as_slice() {
-                [one] => match hub.propose_change_tier(identity, one.clone(), new_tier.to_string()) {
-                    Ok(()) => println!("[{} is now {new_tier}]", &one[..8]),
+                [one] => match hub.propose_change_tier(identity, *one, new_tier.to_string()) {
+                    Ok(()) => println!("[{} is now {new_tier}]", one.short()),
                     Err(e) => println!("[tier change failed: {e}]"),
                 },
                 [] => println!("no member matches {prefix:?}"),
@@ -873,7 +916,7 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
             for id in ids {
                 for (seq, payload, edited, deleted) in hub.history_for(&id) {
                     let flags = format!("{}{}", if edited { " edited" } else { "" }, if deleted { " DELETED" } else { "" });
-                    println!("  [{} #{seq}{flags}] {}", &id[..8], String::from_utf8_lossy(&payload));
+                    println!("  [{} #{seq}{flags}] {}", id.short(), String::from_utf8_lossy(&payload));
                 }
             }
         }
@@ -884,7 +927,7 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
             };
             match decode_public_key(key_hex) {
                 Ok(key) => match hub.propose_add(identity, key, tier.to_string()) {
-                    Ok(()) => println!("[added {} as {tier}; give them the invite and tell them to connect to any member]", &fingerprint(&key)[..8]),
+                    Ok(()) => println!("[added {} as {tier}; give them the invite and tell them to connect to any member]", fingerprint(&key).short()),
                     Err(e) => println!("[add failed: {e}]"),
                 },
                 Err(e) => println!("[bad public key: {e}]"),
@@ -916,7 +959,7 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
                 println!("usage: /delete SEQ   (your own message)");
                 return;
             };
-            if let Err(e) = hub.delete(identity, hub.own_id().clone(), seq) {
+            if let Err(e) = hub.delete(identity, *hub.own_id(), seq) {
                 println!("[delete failed: {e}]");
             }
         }
@@ -925,10 +968,10 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
                 println!("usage: /remove FINGERPRINT-PREFIX   (needs a tier with can_remove)");
                 return;
             };
-            let matches: Vec<String> = hub.member_ids().into_iter().filter(|id| id.starts_with(prefix)).collect();
+            let matches: Vec<PeerId> = hub.member_ids().into_iter().filter(|id| id.to_hex().starts_with(prefix)).collect();
             match matches.as_slice() {
-                [one] => match hub.propose_remove(identity, one.clone()) {
-                    Ok(()) => println!("[removed {}]", &one[..8]),
+                [one] => match hub.propose_remove(identity, *one) {
+                    Ok(()) => println!("[removed {}]", one.short()),
                     Err(e) => println!("[remove failed: {e}]"),
                 },
                 [] => println!("no member matches {prefix:?}"),
@@ -941,12 +984,12 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
                 return;
             };
             let any = parts.next() == Some("any");
-            let matches: Vec<String> = hub.member_ids().into_iter().filter(|id| id.starts_with(prefix)).collect();
+            let matches: Vec<PeerId> = hub.member_ids().into_iter().filter(|id| id.to_hex().starts_with(prefix)).collect();
             match matches.as_slice() {
                 [one] => {
                     let r = if any { hub.fetch_from_anyone(one, seq) } else { hub.fetch(one, seq) };
                     match r {
-                        Ok(()) => println!("[asked for {} #{seq}]", &one[..8]),
+                        Ok(()) => println!("[asked for {} #{seq}]", one.short()),
                         Err(e) => println!("[fetch failed: {e}]"),
                     }
                 }
@@ -959,7 +1002,7 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
                 println!("usage: /read AUTHOR-PREFIX SEQ   (sends a read receipt; needs --read-receipts)");
                 return;
             };
-            let matches: Vec<String> = hub.member_ids().into_iter().filter(|id| id.starts_with(prefix)).collect();
+            let matches: Vec<PeerId> = hub.member_ids().into_iter().filter(|id| id.to_hex().starts_with(prefix)).collect();
             match matches.as_slice() {
                 [one] => match hub.mark_read(one, seq) {
                     Ok(true) => println!("[read receipt sent]"),
@@ -980,21 +1023,21 @@ fn handle_command(cmd: &str, ctx: &Ctx) {
                 println!("no receipts for #{seq}");
             }
             for (who, kind) in r {
-                println!("{}: {:?}", &who[..8], kind);
+                println!("{}: {:?}", who.short(), kind);
             }
         }
         "pending" => {
             for m in hub.member_ids() {
                 let p = hub.existence_only(&m);
                 if !p.is_empty() {
-                    println!("{}: content not held for #{:?}", &m[..8], p);
+                    println!("{}: content not held for #{:?}", m.short(), p);
                 }
             }
         }
         "state" => {
             println!("group      : {}", hub.group_id());
-            println!("you        : {}", &hub.own_id()[..16]);
-            println!("connected  : {:?}", connected.lock().unwrap().iter().map(|p| p[..8].to_string()).collect::<Vec<_>>());
+            println!("you        : {}", &hub.own_id().to_hex()[..16]);
+            println!("connected  : {:?}", connected.lock().unwrap().iter().map(|p| p.short()).collect::<Vec<_>>());
             println!("persistence: {}", if hub.persistence_healthy() { "ok" } else { "FAILING - history not being saved" });
         }
         _ => println!("commands: /members /bots /history /catchup /add KEY [tier] /addbot KEY [tier] /tier FPR TIER /deftier NAME perms /peer KEY=HOST:PORT /edit SEQ text /delete SEQ /remove FPR-PREFIX /fetch FPR-PREFIX SEQ [any] /pending /receipts SEQ /read FPR-PREFIX SEQ /state /help  (// sends a literal slash)"),

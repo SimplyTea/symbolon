@@ -47,6 +47,7 @@ use crate::framing::{read_frame, write_frame};
 use crate::handshake::{self, HandshakeResult, ProgressCallback};
 use crate::identity::{Identity, PeerId, PeerRegistry};
 use crate::message::ControlMessage;
+use crate::padding::{self, Padding};
 use crate::ratchet::{Ratchet, RatchetInfo};
 use crate::reliability::{Inbox, Outbox};
 use crate::sessionstate::{SavedState, SessionPersistence, StateSaver};
@@ -98,6 +99,12 @@ pub struct SessionConfig {
     /// When set, a handshake that authenticates anyone else fails with
     /// [`ChatError::PeerMismatch`]. Responders do not need it.
     pub expect_peer: Option<PeerId>,
+
+    /// Padding applied to what THIS side sends (default: [`Padding::OFF`]).
+    /// See [`crate::padding`] for what it hides and costs. It is a sending
+    /// setting only: the receiving side strips padding whatever its own
+    /// setting is. Can be changed later with [`Session::set_padding`].
+    pub padding: Padding,
 }
 
 impl Default for SessionConfig {
@@ -110,6 +117,7 @@ impl Default for SessionConfig {
             tracer: Arc::new(NoopTracer),
             persistence: None,
             expect_peer: None,
+            padding: Padding::OFF,
         }
     }
 }
@@ -178,6 +186,9 @@ fn send_control(
 }
 
 /// What [`Session::reconnect_or_replace`] did with the new connection.
+// `Replaced` carries a whole Session by value on purpose: it is the rare
+// outcome and boxing it would change the public API for no practical gain.
+#[allow(clippy::large_enum_variant)]
 pub enum Reconnected {
     /// Same peer, same session state on both sides: this session was resumed
     /// in place and unacknowledged messages are being re-delivered.
@@ -232,6 +243,14 @@ pub struct Session {
     reader_thread: Mutex<Option<JoinHandle<()>>>,
 
     outbox: Arc<Mutex<Outbox>>,
+    /// Highest outbox sequence number that existed when the CURRENT
+    /// connection began. The peer's resume request replays only messages
+    /// up to this number: anything stored later is written by `send()` on
+    /// the new link, so replaying it too would put the same bytes on the
+    /// wire twice (harmless, since the receiver drops duplicates, but
+    /// wasteful). Captured after the writer is swapped, so a message
+    /// stored before the swap is replayed (at worst twice, never lost).
+    resend_ceiling: Arc<std::sync::atomic::AtomicU64>,
     inbox: Arc<Mutex<Inbox>>,
     /// Double Ratchet state. Lives for the whole `Session`, *across*
     /// reconnects: the transport keys are replaced on every new TCP
@@ -252,6 +271,9 @@ pub struct Session {
     pending: Arc<Mutex<VecDeque<Vec<u8>>>>,
     /// Was this session resumed from saved state?
     restored: bool,
+    /// Block size used to pad outgoing messages (0 = off). Atomic so an app
+    /// can change the setting while the session is running.
+    padding_block: std::sync::atomic::AtomicU16,
 }
 
 /// Build the associated data bound into every message's authentication tag:
@@ -407,7 +429,7 @@ impl Session {
                     // Peer restarted or we presented a different epoch:
                     // the saved ratchet can never work again.
                     config.tracer.event(&TraceEvent::SessionStateDiscarded {
-                        peer: handshake_result.peer_id.clone(),
+                        peer: handshake_result.peer_id,
                         reason: "peer no longer holds the matching session",
                     });
                     p.discard(&handshake_result.peer_id);
@@ -415,7 +437,7 @@ impl Session {
                 Ok(None) => {}
                 Err(_) => {
                     config.tracer.event(&TraceEvent::SessionStateDiscarded {
-                        peer: handshake_result.peer_id.clone(),
+                        peer: handshake_result.peer_id,
                         reason: "saved state unreadable",
                     });
                     p.discard(&handshake_result.peer_id);
@@ -445,6 +467,9 @@ impl Session {
                 Vec::new(),
             ),
         };
+        // A restored outbox may hold unacked messages from before the
+        // restart; they all count as "existed before this link".
+        let resend_ceiling = Arc::new(std::sync::atomic::AtomicU64::new(outbox.highest_seq()));
         let outbox = Arc::new(Mutex::new(outbox));
         let inbox = Arc::new(Mutex::new(inbox));
         let control_seq = Arc::new(Mutex::new(1u64));
@@ -464,7 +489,7 @@ impl Session {
         let saver = config.persistence.as_ref().map(|p| {
             StateSaver::new(
                 Arc::clone(p),
-                handshake_result.peer_id.clone(),
+                handshake_result.peer_id,
                 handshake_result.own_epoch,
                 handshake_result.peer_epoch,
                 Arc::clone(&ratchet),
@@ -480,7 +505,7 @@ impl Session {
         }
         if was_restored {
             config.tracer.event(&TraceEvent::SessionRestored {
-                peer: handshake_result.peer_id.clone(),
+                peer: handshake_result.peer_id,
             });
         }
 
@@ -500,6 +525,7 @@ impl Session {
             link: Arc::new(LinkState::new(config.clock.clone(), config.tracer.clone())),
             reader_thread: Mutex::new(None),
             outbox,
+            resend_ceiling,
             inbox,
             ratchet,
             control_seq,
@@ -507,12 +533,29 @@ impl Session {
             saver,
             pending,
             restored: was_restored,
+            padding_block: std::sync::atomic::AtomicU16::new(config.padding.block_size()),
         };
 
         session.spawn_reader(parts.reader, tx);
         session.start_keepalive(config, closer);
         session.send_resume_request()?;
         Ok(session)
+    }
+
+    /// Change how messages this side SENDS are padded, from now on. Messages
+    /// already queued keep the padding they were built with. The peer needs
+    /// no matching setting (see [`crate::padding`]).
+    pub fn set_padding(&self, padding: Padding) {
+        self.padding_block
+            .store(padding.block_size(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The padding currently applied to outgoing messages.
+    pub fn padding(&self) -> Padding {
+        Padding::from_raw(
+            self.padding_block
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// `true` if this session was resumed from saved state (see
@@ -525,7 +568,7 @@ impl Session {
     /// permissions...). While it fails, sends are refused rather than risk
     /// reusing an encryption key after a crash.
     pub fn persistence_healthy(&self) -> bool {
-        self.saver.as_ref().map_or(true, |s| !s.failing())
+        self.saver.as_ref().is_none_or(|s| !s.failing())
     }
 
     /// Re-establish this session on a brand new TCP connection after a
@@ -672,6 +715,11 @@ impl Session {
             recv_key: handshake_result.recv_key,
         };
         *self.write_stream.lock().unwrap() = parts.writer;
+        // Capture AFTER the swap (see `resend_ceiling`): a send() that
+        // stores a message after this point writes it to the new link.
+        let ceiling = self.outbox.lock().unwrap().highest_seq();
+        self.resend_ceiling
+            .store(ceiling, std::sync::atomic::Ordering::SeqCst);
         let closer: Arc<dyn Fn() + Send + Sync> = Arc::from(parts.closer);
         *self.shutdown_handle.lock().unwrap() = Some(closer.clone());
 
@@ -721,7 +769,10 @@ impl Session {
             let mut ob = self.outbox.lock().unwrap();
             let before = self.saver.as_ref().map(|_| r.clone());
             let seq = ob.reserve_seq();
-            let blob = match r.encrypt(payload) {
+            // Pad inside the encryption so the wire size reveals only the
+            // block the message fell in (see `crate::padding`).
+            let padded = padding::pad(payload, self.padding());
+            let blob = match r.encrypt(&padded) {
                 Ok(b) => b,
                 Err(e) => {
                     ob.rollback(seq);
@@ -794,7 +845,7 @@ impl Session {
     }
 
     pub fn peer_id(&self) -> PeerId {
-        self.peer_id.lock().unwrap().clone()
+        *self.peer_id.lock().unwrap()
     }
 
     /// Our own identity's fingerprint - so a UI can show "you" alongside
@@ -889,6 +940,7 @@ impl Session {
     fn spawn_reader(&self, mut read_stream: Box<dyn Read + Send>, tx: Sender<Result<Vec<u8>>>) {
         let keys = Arc::clone(&self.keys);
         let outbox = Arc::clone(&self.outbox);
+        let resend_ceiling = Arc::clone(&self.resend_ceiling);
         let inbox = Arc::clone(&self.inbox);
         let ratchet = Arc::clone(&self.ratchet);
         let write_stream = Arc::clone(&self.write_stream);
@@ -935,7 +987,14 @@ impl Session {
                             // ratchets disagree (bug or active compromise) -
                             // surface it to `recv()` instead of silently
                             // dropping a message.
-                            let msg = ratchet.lock().unwrap().decrypt(&blob);
+                            // Strip the padding straight away so everything
+                            // after this (the saved queue, the app) only
+                            // ever sees the real payload.
+                            let msg = ratchet
+                                .lock()
+                                .unwrap()
+                                .decrypt(&blob)
+                                .and_then(padding::unpad);
                             if let (Some(sv), Ok(m)) = (&saver, &msg) {
                                 sv.pending.lock().unwrap().push_back(m.clone());
                             }
@@ -1035,8 +1094,12 @@ impl Session {
                             ControlMessage::ResumeRequest {
                                 last_contiguous_seq,
                             } => {
-                                let to_resend =
+                                let ceiling =
+                                    resend_ceiling.load(std::sync::atomic::Ordering::SeqCst);
+                                let mut to_resend =
                                     outbox.lock().unwrap().messages_after(last_contiguous_seq);
+                                // Only what existed before this link began.
+                                to_resend.retain(|(rseq, _)| *rseq <= ceiling);
                                 if !to_resend.is_empty() {
                                     link.tracer.event(&TraceEvent::Retransmitted {
                                         count: to_resend.len(),
@@ -1147,6 +1210,9 @@ impl Drop for Session {
 }
 
 /// [`run_handshake`] plus start/finish/failure trace events.
+// Internal helper that threads the handshake inputs through; a parameter struct
+// would only move the same eight values around.
+#[allow(clippy::too_many_arguments)]
 fn traced_handshake(
     stream: &mut Box<dyn Connection>,
     role: Role,
@@ -1175,9 +1241,9 @@ fn traced_handshake(
         on_progress,
     );
     match &r {
-        Ok(h) => config.tracer.event(&TraceEvent::HandshakeCompleted {
-            peer: h.peer_id.clone(),
-        }),
+        Ok(h) => config
+            .tracer
+            .event(&TraceEvent::HandshakeCompleted { peer: h.peer_id }),
         Err(e) => config.tracer.event(&TraceEvent::HandshakeFailed {
             reason: e.to_string(),
         }),
@@ -1189,6 +1255,7 @@ fn traced_handshake(
 /// socket read timeout for the duration of the handshake only - normal
 /// post-handshake operation relies on `reconnect`/background-thread logic
 /// instead of a read timeout, so it's cleared again before returning.
+#[allow(clippy::too_many_arguments)] // see traced_handshake
 fn run_handshake(
     stream: &mut Box<dyn Connection>,
     role: Role,

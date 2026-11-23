@@ -16,11 +16,9 @@ use std::time::Duration;
 
 use symbolon::discovery::{Announcement, Disclose};
 use symbolon::framing::MAX_FRAME_LEN;
-use symbolon::group::{
-    GroupContent, GroupMessage, ReceiptKind, Roster, RosterOpWire,
-};
+use symbolon::group::{GroupContent, GroupMessage, ReceiptKind, Roster, RosterOpWire};
 use symbolon::handshake::{run_initiator, run_responder};
-use symbolon::identity::Identity;
+use symbolon::identity::{Identity, PeerId};
 use symbolon::message::ControlMessage;
 use symbolon::peer::PeerRegistry;
 use symbolon::persistence::{EncryptedIdentity, KdfParams};
@@ -72,7 +70,11 @@ impl<'a> Walker<'a> {
         u64::from_be_bytes(self.take(name, 8).try_into().unwrap())
     }
     fn done(self) {
-        assert_eq!(self.at, self.bytes.len(), "layout in the doc does not cover every byte");
+        assert_eq!(
+            self.at,
+            self.bytes.len(),
+            "layout in the doc does not cover every byte"
+        );
     }
 }
 
@@ -83,7 +85,11 @@ fn proxy(listen: TcpListener, target: std::net::SocketAddr, log: Arc<Mutex<[Vec<
     let (client, _) = listen.accept().unwrap();
     let server = TcpStream::connect(target).unwrap();
     for (dir, from, to) in [
-        (0usize, client.try_clone().unwrap(), server.try_clone().unwrap()),
+        (
+            0usize,
+            client.try_clone().unwrap(),
+            server.try_clone().unwrap(),
+        ),
         (1usize, server, client),
     ] {
         let log = Arc::clone(&log);
@@ -137,7 +143,13 @@ fn part_a_session_on_the_wire() {
         let (s, _) = bob_listener.accept().unwrap();
         Session::establish(s, Role::Responder, &bob, &rb).unwrap()
     });
-    let a = Session::establish(TcpStream::connect(proxy_addr).unwrap(), Role::Initiator, &alice, &ra).unwrap();
+    let a = Session::establish(
+        TcpStream::connect(proxy_addr).unwrap(),
+        Role::Initiator,
+        &alice,
+        &ra,
+    )
+    .unwrap();
     let b = bt.join().unwrap();
 
     a.send(b"hello bob").unwrap(); // 9 bytes
@@ -152,55 +164,115 @@ fn part_a_session_on_the_wire() {
     let to_bob = frames(&log[0]);
     let to_alice = frames(&log[1]);
 
-    // Handshake: exactly one frame of each kind, in this order.
-    assert_eq!(to_bob[0].len(), 4 + 86);
-    assert_eq!(to_alice[0].len(), 4 + 150);
-    assert_eq!(to_bob[1].len(), 4 + 64);
+    // Handshake: two frames each way, in this order (the first pair are bare
+    // ephemeral keys; the second pair are encrypted and hold the identities).
+    assert_eq!(to_bob[0].len(), 4 + 32 + 1184);
+    assert_eq!(to_alice[0].len(), 4 + 32 + 1088);
+    assert_eq!(to_bob[1].len(), 4 + 118 + 16);
+    assert_eq!(to_bob[2].len(), 4 + 16); // Msg5: empty plaintext + tag
+    assert_eq!(to_alice[1].len(), 4 + 118 + 16);
 
     let f = &to_bob[0];
-    let mut w = Walker::new("Handshake Msg1 (initiator to responder), including the 4-byte length prefix", f);
+    let mut w = Walker::new(
+        "Handshake Msg1 (initiator to responder), including the 4-byte length prefix",
+        f,
+    );
     w.u32("frame length");
-    w.take("version (major.minor.patch, 3 x u16)", 6);
-    w.take("initiator Ed25519 public key", 32);
     w.take("initiator ephemeral X25519 public key", 32);
-    w.take("initiator epoch (random)", 16);
+    w.take(
+        "initiator ML-KEM-768 encapsulation key (post-quantum half)",
+        1184,
+    );
     w.done();
 
     let f = &to_alice[0];
     let mut w = Walker::new("Handshake Msg2 (responder to initiator)", f);
     w.u32("frame length");
-    w.take("version", 6);
-    w.take("responder Ed25519 public key", 32);
     w.take("responder ephemeral X25519 public key", 32);
-    w.take("responder epoch (random)", 16);
-    w.take("responder signature over the transcript", 64);
+    w.take(
+        "ML-KEM-768 ciphertext (the encapsulated post-quantum secret)",
+        1088,
+    );
     w.done();
 
     let f = &to_bob[1];
-    let mut w = Walker::new("Handshake Msg3 (initiator to responder)", f);
+    let mut w = Walker::new("Handshake Msg3 (initiator to responder), encrypted", f);
     w.u32("frame length");
-    w.take("initiator signature over the transcript", 64);
+    w.take(
+        "ciphertext of: version (6) + Ed25519 public key (32) + epoch (16) + signature (64)",
+        118,
+    );
+    w.take("authentication tag", 16);
     w.done();
+
+    let f = &to_alice[1];
+    let mut w = Walker::new("Handshake Msg4 (responder to initiator), encrypted", f);
+    w.u32("frame length");
+    w.take(
+        "ciphertext of: version (6) + Ed25519 public key (32) + epoch (16) + signature (64)",
+        118,
+    );
+    w.take("authentication tag", 16);
+    w.done();
+
+    let f = &to_bob[2];
+    let mut w = Walker::new("Handshake Msg5 (initiator to responder), encrypted", f);
+    w.u32("frame length");
+    w.take(
+        "authentication tag of an empty plaintext (confirmation)",
+        16,
+    );
+    w.done();
+
+    let hs_total: usize = to_bob[..3]
+        .iter()
+        .chain(to_alice[..2].iter())
+        .map(|f| f.len())
+        .sum();
+    println!(
+        "\nHandshake total on the wire: {hs_total} bytes in 5 frames. The post-quantum half \
+         adds {} bytes once per connection (1184-byte key + 1088-byte ciphertext); every \
+         message after the handshake is unchanged.",
+        1184 + 1088
+    );
 
     println!("\n### Every frame after the handshake (all encrypted; only the header is readable)");
     println!("| direction | frame | total bytes on wire | length prefix | channel | seq | ciphertext+tag |");
     println!("|---|---:|---:|---:|---|---:|---:|");
     let mut data_sizes = vec![];
-    for (name, list, skip) in [("alice to bob", &to_bob, 2usize), ("bob to alice", &to_alice, 1)] {
+    for (name, list, skip) in [
+        ("alice to bob", &to_bob, 3usize),
+        ("bob to alice", &to_alice, 2),
+    ] {
         for (i, fr) in list.iter().enumerate().skip(skip) {
             let len = u32::from_be_bytes(fr[0..4].try_into().unwrap()) as usize;
             let ch = if fr[4] == 0 { "Data" } else { "Control" };
             let seq = u64::from_be_bytes(fr[5..13].try_into().unwrap());
-            println!("| {name} | {i} | {} | {len} | {ch} | {seq} | {} |", fr.len(), fr.len() - 13);
+            println!(
+                "| {name} | {i} | {} | {len} | {ch} | {seq} | {} |",
+                fr.len(),
+                fr.len() - 13
+            );
             if fr[4] == 0 {
                 data_sizes.push(fr.len());
             }
         }
     }
-    // 9-byte message => 4 + 9 + (40 + 9 + 16) + 16 = 94;  32-byte => 117
-    assert!(data_sizes.contains(&(9 + 85)), "9-byte payload should cost 85 bytes of overhead");
-    assert!(data_sizes.contains(&(32 + 85)), "32-byte payload should cost 85 bytes of overhead");
-    println!("\nOverhead per data message = {} bytes (9-byte payload -> {} on the wire).", 85, 9 + 85);
+    // Padding is off by default but its 1-byte marker is always added:
+    // 9-byte message => 4 + 9 + (40 + (9 + 1) + 16) + 16 = 95;  32-byte => 118
+    assert!(
+        data_sizes.contains(&(9 + 86)),
+        "9-byte payload should cost 86 bytes of overhead"
+    );
+    assert!(
+        data_sizes.contains(&(32 + 86)),
+        "32-byte payload should cost 86 bytes of overhead"
+    );
+    println!(
+        "\nOverhead per data message = {} bytes (85 + the 1-byte padding marker; 9-byte payload -> {} on the wire).",
+        86,
+        9 + 86
+    );
 }
 
 // ----------------------------------------------------------- B. the ratchet
@@ -214,8 +286,7 @@ fn part_b_ratchet() {
     rb.trust(alice.public_key());
     let (mut ca, mut cb) = memory_pair(Duration::ZERO);
     let bt = thread::spawn(move || {
-        let r = run_responder(&mut cb, &bob, &rb, &|_: &String| [2u8; 16], None).unwrap();
-        r
+        run_responder(&mut cb, &bob, &rb, &|_: &PeerId| [2u8; 16], None).unwrap()
     });
     let ha = run_initiator(&mut ca, &alice, &ra, &[1u8; 16], None).unwrap();
     let hb = bt.join().unwrap();
@@ -231,12 +302,23 @@ fn part_b_ratchet() {
     rat_b.decrypt(&m3).unwrap();
     for (title, m, body) in [
         ("Ratchet blob 1: responder's first message", &m1, 5usize),
-        ("Ratchet blob 2: same chain, counter n goes up, same DH key", &m2, 6),
-        ("Ratchet blob 3: other side replies, NEW DH key, pn = length of previous chain", &m3, 5),
+        (
+            "Ratchet blob 2: same chain, counter n goes up, same DH key",
+            &m2,
+            6,
+        ),
+        (
+            "Ratchet blob 3: other side replies, NEW DH key, pn = length of previous chain",
+            &m3,
+            5,
+        ),
     ] {
         let mut w = Walker::new(title, m);
         w.take("header: sender's current ratchet public key (X25519)", 32);
-        let pn = w.take("header: pn = messages in the previous sending chain (u32)", 4);
+        let pn = w.take(
+            "header: pn = messages in the previous sending chain (u32)",
+            4,
+        );
         let n = w.take("header: n = this message's number in the chain (u32)", 4);
         let _ = (pn, n);
         w.take("ciphertext of the payload", body);
@@ -250,11 +332,38 @@ fn part_b_ratchet() {
 fn part_c_control() {
     println!("\n## C. Control messages (the plaintext inside Control frames)");
     let cases: Vec<(&str, ControlMessage)> = vec![
-        ("Ack: received everything up to 5, but 7 and 9 are missing", ControlMessage::Ack { cumulative_ack: 5, missing: vec![7, 9] }),
-        ("Ack with nothing missing", ControlMessage::Ack { cumulative_ack: 42, missing: vec![] }),
-        ("ResumeRequest", ControlMessage::ResumeRequest { last_contiguous_seq: 100 }),
-        ("Ping", ControlMessage::Ping { nonce: 0x1122334455667788 }),
-        ("Pong", ControlMessage::Pong { nonce: 0x1122334455667788 }),
+        (
+            "Ack: received everything up to 5, but 7 and 9 are missing",
+            ControlMessage::Ack {
+                cumulative_ack: 5,
+                missing: vec![7, 9],
+            },
+        ),
+        (
+            "Ack with nothing missing",
+            ControlMessage::Ack {
+                cumulative_ack: 42,
+                missing: vec![],
+            },
+        ),
+        (
+            "ResumeRequest",
+            ControlMessage::ResumeRequest {
+                last_contiguous_seq: 100,
+            },
+        ),
+        (
+            "Ping",
+            ControlMessage::Ping {
+                nonce: 0x1122334455667788,
+            },
+        ),
+        (
+            "Pong",
+            ControlMessage::Pong {
+                nonce: 0x1122334455667788,
+            },
+        ),
     ];
     for (title, msg) in cases {
         let b = msg.encode();
@@ -294,8 +403,12 @@ fn part_d_group() {
     let bob = Identity::generate();
     let (_roster, genesis) = Roster::genesis_default(&alice, vec![bob.public_key()]);
     let wire = RosterOpWire::from(&genesis);
-    println!("\n(group id is {} characters: `{}`)", wire.group_id.len(), short(wire.group_id.as_bytes()));
-    let sender = alice.fingerprint(); // 64 hex characters, sent as ASCII text
+    println!(
+        "\n(group id is {} raw bytes: `{}`)",
+        wire.group_id.as_bytes().len(),
+        short(wire.group_id.as_bytes())
+    );
+    let sender = alice.fingerprint(); // 32 raw bytes on the wire
     let filler_sig = [0xEEu8; 64]; // placeholder: the example cannot reach the private signing function
     let zero = [0u8; 32];
 
@@ -303,8 +416,7 @@ fn part_d_group() {
     let b = GroupMessage::Roster(wire.clone()).encode();
     let mut w = Walker::new("Roster message carrying the Genesis operation", &b);
     w.take("tag 0x11 = Roster", 1);
-    let n = w.u16("group id length");
-    w.take("group id (ASCII hex)", n);
+    w.take("group id (raw 32 bytes)", 32);
     w.u64("roster version (0 = genesis)");
     w.take("previous roster hash (all zero at genesis)", 32);
     let oplen = w.u32("operation length");
@@ -317,7 +429,10 @@ fn part_d_group() {
     for _ in 0..tiers {
         let l = w.u16("  tier name length");
         w.take("  tier name", l);
-        w.take("  permissions bitmask (add=1, remove=2, read=4, write=8)", 1);
+        w.take(
+            "  permissions bitmask (add=1, remove=2, read=4, write=8)",
+            1,
+        );
     }
     let members = w.u16("number of members");
     for _ in 0..members {
@@ -326,19 +441,35 @@ fn part_d_group() {
         w.take("  member tier name", l);
     }
     assert_eq!(w.at - op_start, oplen);
-    let pl = w.u16("proposer id length");
-    w.take("proposer id (ASCII hex)", pl);
+    w.take("proposer id (raw 32 bytes)", 32);
     w.take("proposer Ed25519 signature", 64);
     w.done();
 
     // --- Application (Post / Edit / Delete)
     for (title, content) in [
-        ("Application message: Post \"hello group\"", GroupContent::Post { payload: b"hello group".to_vec() }),
-        ("Application message: Edit of #1", GroupContent::Edit { target_seq: 1, new_payload: b"hello, group".to_vec() }),
-        ("Application message: Delete of #1", GroupContent::Delete { target_sender: sender.clone(), target_seq: 1 }),
+        (
+            "Application message: Post \"hello group\"",
+            GroupContent::Post {
+                payload: b"hello group".to_vec(),
+            },
+        ),
+        (
+            "Application message: Edit of #1",
+            GroupContent::Edit {
+                target_seq: 1,
+                new_payload: b"hello, group".to_vec(),
+            },
+        ),
+        (
+            "Application message: Delete of #1",
+            GroupContent::Delete {
+                target_sender: sender,
+                target_seq: 1,
+            },
+        ),
     ] {
         let msg = GroupMessage::Application {
-            sender: sender.clone(),
+            sender,
             seq: 1,
             prev_hash: zero,
             roster_version: 0,
@@ -348,10 +479,12 @@ fn part_d_group() {
         let b = msg.encode();
         let mut w = Walker::new(title, &b);
         w.take("tag 0x10 = Application", 1);
-        let sl = w.u16("author id length");
-        w.take("author id (ASCII hex of SHA-256(public key))", sl);
+        w.take("author id (raw 32 bytes: SHA-256(public key))", 32);
         w.u64("author's sequence number");
-        w.take("hash of this author's previous message (zero for the first)", 32);
+        w.take(
+            "hash of this author's previous message (zero for the first)",
+            32,
+        );
         w.u64("roster version the author wrote under");
         let cl = w.u32("content length");
         let start = w.at;
@@ -360,56 +493,74 @@ fn part_d_group() {
                 w.take("content kind 0 = Post", 1);
                 w.take("payload (your text)", payload.len());
             }
-            GroupContent::Edit { ref new_payload, .. } => {
+            GroupContent::Edit {
+                ref new_payload, ..
+            } => {
                 w.take("content kind 1 = Edit", 1);
                 w.u64("target sequence number being edited");
                 w.take("new payload", new_payload.len());
             }
             GroupContent::Delete { .. } => {
                 w.take("content kind 2 = Delete", 1);
-                let l = w.u16("target author id length");
-                w.take("target author id", l);
+                w.take("target author id (raw 32 bytes)", 32);
                 w.u64("target sequence number");
+            }
+            GroupContent::File { ref offer } => {
+                w.take("content kind 3 = File offer", 1);
+                w.take(
+                    "file offer (name, size, chunk size, root, prefix)",
+                    offer.encode().len(),
+                );
             }
         }
         assert_eq!(w.at - start, cl);
-        w.take("author Ed25519 signature (placeholder bytes 0xEE in this dump)", 64);
+        w.take(
+            "author Ed25519 signature (placeholder bytes 0xEE in this dump)",
+            64,
+        );
         w.done();
     }
 
     // --- Small control-style group messages
-    let b = GroupMessage::Have { sender: sender.clone(), seq: 7 }.encode();
+    let b = GroupMessage::Have { sender, seq: 7 }.encode();
     let mut w = Walker::new("Have: \"I hold message 7 by this author\"", &b);
     w.take("tag 0x17 = Have", 1);
-    let l = w.u16("author id length");
-    w.take("author id", l);
+    w.take("author id (raw 32 bytes)", 32);
     w.u64("sequence number");
     w.done();
 
-    let b = GroupMessage::RelayRequest { sender: sender.clone(), after_seq: 3 }.encode();
-    let mut w = Walker::new("RelayRequest: \"send me what you hold from this author after 3\"", &b);
+    let b = GroupMessage::RelayRequest {
+        sender,
+        after_seq: 3,
+    }
+    .encode();
+    let mut w = Walker::new(
+        "RelayRequest: \"send me what you hold from this author after 3\"",
+        &b,
+    );
     w.take("tag 0x12 = RelayRequest", 1);
-    let l = w.u16("author id length");
-    w.take("author id", l);
+    w.take("author id (raw 32 bytes)", 32);
     w.u64("after_seq");
     w.done();
 
-    let b = GroupMessage::FetchRequest { sender: sender.clone(), seq: 4 }.encode();
+    let b = GroupMessage::FetchRequest { sender, seq: 4 }.encode();
     let mut w = Walker::new("FetchRequest: \"send me exactly message 4\"", &b);
     w.take("tag 0x15 = FetchRequest", 1);
-    let l = w.u16("author id length");
-    w.take("author id", l);
+    w.take("author id (raw 32 bytes)", 32);
     w.u64("sequence number");
     w.done();
 
     let b = GroupMessage::RosterSyncRequest { have_version: 2 }.encode();
-    let mut w = Walker::new("RosterSyncRequest: \"I have roster version 2, send newer\"", &b);
+    let mut w = Walker::new(
+        "RosterSyncRequest: \"I have roster version 2, send newer\"",
+        &b,
+    );
     w.take("tag 0x13 = RosterSyncRequest", 1);
     w.u64("have_version");
     w.done();
 
     let b = GroupMessage::Existence {
-        sender: sender.clone(),
+        sender,
         seq: 5,
         prev_hash: zero,
         roster_version: 0,
@@ -419,8 +570,7 @@ fn part_d_group() {
     .encode();
     let mut w = Walker::new("Existence notice: \"message 5 exists\" (no content)", &b);
     w.take("tag 0x14 = Existence", 1);
-    let l = w.u16("author id length");
-    w.take("author id", l);
+    w.take("author id (raw 32 bytes)", 32);
     w.u64("sequence number");
     w.take("previous message hash", 32);
     w.u64("roster version");
@@ -429,7 +579,7 @@ fn part_d_group() {
     w.done();
 
     let b = GroupMessage::Receipt {
-        author: sender.clone(),
+        author: sender,
         seq: 5,
         content_hash: [0xCDu8; 32],
         kind: ReceiptKind::Delivered,
@@ -439,13 +589,11 @@ fn part_d_group() {
     .encode();
     let mut w = Walker::new("Receipt: \"I (receiver) got message 5\"", &b);
     w.take("tag 0x16 = Receipt", 1);
-    let l = w.u16("author id length");
-    w.take("author id", l);
+    w.take("author id (raw 32 bytes)", 32);
     w.u64("sequence number");
     w.take("SHA-256 of the content received", 32);
     w.take("kind (0 = delivered, 1 = read)", 1);
-    let l = w.u16("receiver id length");
-    w.take("receiver id", l);
+    w.take("receiver id (raw 32 bytes)", 32);
     w.take("receiver signature (placeholder)", 64);
     w.done();
 }
@@ -458,13 +606,17 @@ fn part_e_files_and_discovery() {
     let dir = std::env::temp_dir().join(format!("symbolon-wire-dump-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("id.enc");
-    EncryptedIdentity::save_with_params(&id, &path, "demo", KdfParams::insecure_fast_for_tests()).unwrap();
+    EncryptedIdentity::save_with_params(&id, &path, "demo", KdfParams::insecure_fast_for_tests())
+        .unwrap();
     let b = std::fs::read(&path).unwrap();
     let mut w = Walker::new("Identity file on disk (`SYMI`, format 2)", &b);
     w.take("magic \"SYMI\"", 4);
     w.take("format version (u16 = 2)", 2);
     w.take("Argon2id salt (random)", 16);
-    w.take("Argon2id memory cost in KiB (u32; demo uses weak test settings)", 4);
+    w.take(
+        "Argon2id memory cost in KiB (u32; demo uses weak test settings)",
+        4,
+    );
     w.take("Argon2id time cost (u32)", 4);
     w.take("Argon2id lanes (u32)", 4);
     w.take("AEAD nonce (random)", 12);
@@ -478,7 +630,9 @@ fn part_e_files_and_discovery() {
         ("Discovery beacon, default (major only)", Disclose::Major),
         ("Discovery beacon, full version disclosed", Disclose::Full),
     ] {
-        let b = Announcement::new("tea-laptop", (0, 2, 0), level, 7000).unwrap().encode();
+        let b = Announcement::new("tea-laptop", (0, 2, 0), level, 7000)
+            .unwrap()
+            .encode();
         let mut w = Walker::new(title, &b);
         let _ = w.take("magic \"SYMD\"", 4);
         w.take("wire version", 1);

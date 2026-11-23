@@ -32,6 +32,7 @@ audited**; do not protect anything important with it yet
 | [Bots](docs/BOTS.md) | Bot members, sponsors, scripting |
 | [Ordering](docs/ORDERING.md) | Why there is no global order; Lamport clock and other options |
 | [Storage and plug-ins](docs/STORAGE_AND_PLUGINS.md) | The traits you can replace; encryption at rest |
+| [File transfer](docs/FILES.md) | Offers shown before download, hash-checked chunks, limits, what is built so far |
 | [Discovery](docs/DISCOVERY.md) | Finding peers on a LAN, and what it costs in privacy |
 | [Future crypto](docs/FUTURE_CRYPTO.md) | Post-quantum, MLS, and why not sender keys |
 | [Threat model](docs/THREAT_MODEL.md) | Who we defend against, metadata, known gaps |
@@ -109,7 +110,7 @@ Run it with `cargo run --example two_peers`. For groups see
 ## Tests and tools
 
 ```
-cargo test                       # 207 tests: unit plus real-TCP integration
+cargo test                       # 269 tests: unit plus real-TCP integration
 cargo run --release --example bench > bench.csv   # per-operation CPU costs
 cargo run --example wire_dump    # real bytes of every message, field by field
 ```
@@ -119,18 +120,24 @@ group roster sync, receipts, existence notices and forwarding. They double as
 executable documentation. `NOTES.md` is the running development log with the
 reasons behind each decision.
 
+`scripts/e2e/run_all.sh` additionally drives the real `symbolon` program as separate
+processes (see `scripts/e2e/README.md`).
+
 A command-line app (`src/bin/symbolon`) exists for manual testing and is not
 documented here; the docs describe the library.
 
 ## Dependencies
 
 Narrow and well known: `ed25519-dalek`, `x25519-dalek`, `chacha20poly1305`,
-`hkdf`, `sha2`, `rand_core`, `argon2` (plus a few pinned transitive crates for
-older toolchains, noted in `Cargo.toml`). Everything else, including framing,
+`hkdf`, `sha2`, `rand_core`, `argon2`, `zeroize` and `ml-kem` (the RustCrypto
+ML-KEM, which has not been independently audited; see the
+[Threat model](docs/THREAT_MODEL.md)). Some transitive crates are pinned, noted in
+`Cargo.toml`. Everything else, including framing,
 threads and the TCP transport, is on `std`.
 
 ## What this is not
 
-Not audited, not released, not yet post-quantum, no key rotation, and groups
+Not audited, not released, post-quantum key exchange but classical signatures
+and identities, no key rotation, and groups
 are a full mesh (cost grows with the square of group size) until the
 tree-based design in the [Plan](docs/PLAN.md) lands.

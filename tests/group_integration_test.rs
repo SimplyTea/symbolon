@@ -607,10 +607,7 @@ fn a_failing_event_store_is_reported_as_unhealthy() {
     impl EventStore for Flaky {
         fn append(&self, r: &[u8]) -> symbolon::Result<()> {
             if self.broken.load(Ordering::SeqCst) {
-                return Err(symbolon::ChatError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "disk full",
-                )));
+                return Err(symbolon::ChatError::Io(std::io::Error::other("disk full")));
             }
             self.inner.append(r)
         }

@@ -91,6 +91,13 @@ pub enum TraceEvent {
         author: PeerId,
         seq: u64,
     },
+    /// A second copy of a message we already hold, arriving by another path
+    /// (for example straight from the author AND via a member that announced
+    /// it). Harmless, identical, ignored. Not an attack and not an error.
+    GroupMessageDuplicate {
+        author: PeerId,
+        seq: u64,
+    },
     /// A group message was dropped. `reason` is a short static string.
     GroupMessageRejected {
         author: PeerId,

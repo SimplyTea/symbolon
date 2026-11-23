@@ -57,7 +57,7 @@ asked. Options we weighed:
 | Periodic catch-up timer | Trivial | Polls forever; noisy; hides real bugs (removed as default; `--catchup` remains an opt-in safety net in the CLI) |
 | Flood-forward full messages | Fast | O(N²) copies; leaks content to people who should only get existence notices |
 | Link-state hints ("who is connected to whom") | Efficient routing | Tells every member the group's connection graph, which is metadata |
-| **Announce-and-request (`Have`)** (**chosen**) | After accepting a message, tell other readers "I have (author, seq)"; whoever lacks it asks once | Tiny messages; honours relay policy; no extra copies in a full mesh; a hop-by-hop spread | One extra round trip; needs a debounce (300 ms per author) |
+| **Announce-and-request (`Have`)** (**chosen**) | After accepting a message, tell other readers "I have (author, seq)"; whoever lacks it asks once | Tiny messages; honours relay policy; no extra copies in a full mesh; a hop-by-hop spread | One extra round trip; needs a request limit (one per author per 300 ms, with one follow-up so the last announcement is never lost) |
 
 Privacy by construction: a `Have` travels only over sessions attached to **this
 group**, only to members who currently hold `can_read`, and says nothing about
@@ -66,6 +66,12 @@ loop. How other systems do it, as far as we know: Signal and Matrix use
 servers; Briar syncs per shared group with contacts only; Secure Scuttlebutt
 gossips whole feeds, which exposes who follows whom; libp2p gossip exposes
 topic subscriptions.
+
+**Duplicates.** The same message can legitimately arrive twice (straight from
+its author and again via a `Have`-prompted fetch). An identical second copy is
+ignored quietly (trace event `GroupMessageDuplicate`). A *different* message
+under a sequence number we already hold is the author signing two versions,
+and is rejected loudly. See [Threat model](THREAT_MODEL.md).
 
 ## 4. Receipts
 

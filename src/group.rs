@@ -79,13 +79,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{ChatError, Result};
+use crate::file::FileOffer;
 use crate::identity::{fingerprint, Identity, PeerId, PeerRegistry};
 use crate::session::Session;
 use crate::trace::TraceEvent;
 
+mod files;
+
 /// Stable identifier for a group, fixed forever at creation time (see
 /// [`Roster::genesis`]).
-pub type GroupId = String;
+pub use crate::ids::GroupId;
 
 /// The name of a permission tier (e.g. `"owner"`, `"member"`). Freely
 /// chosen per group, not a fixed enum, so different groups can use
@@ -365,58 +368,54 @@ impl RosterOp {
                 out.push(relay.to_byte());
                 out.extend_from_slice(&(tiers.len() as u16).to_be_bytes());
                 for (name, perms) in tiers {
-                    let name_bytes = name.as_bytes();
-                    out.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
-                    out.extend_from_slice(name_bytes);
+                    let name_b = name.as_bytes();
+                    out.extend_from_slice(&(name_b.len() as u16).to_be_bytes());
+                    out.extend_from_slice(name_b);
                     out.push(perms.to_byte());
                 }
                 out.extend_from_slice(&(members.len() as u16).to_be_bytes());
                 for (key, tier) in members {
                     out.extend_from_slice(key.as_bytes());
-                    let tier_bytes = tier.as_bytes();
-                    out.extend_from_slice(&(tier_bytes.len() as u16).to_be_bytes());
-                    out.extend_from_slice(tier_bytes);
+                    let tier_b = tier.as_bytes();
+                    out.extend_from_slice(&(tier_b.len() as u16).to_be_bytes());
+                    out.extend_from_slice(tier_b);
                 }
                 out
             }
             RosterOp::Add { member, tier } => {
                 let mut out = vec![1u8];
                 out.extend_from_slice(member.as_bytes());
-                let tier_bytes = tier.as_bytes();
-                out.extend_from_slice(&(tier_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(tier_bytes);
+                let tier_b = tier.as_bytes();
+                out.extend_from_slice(&(tier_b.len() as u16).to_be_bytes());
+                out.extend_from_slice(tier_b);
                 out
             }
             RosterOp::AddBot { member, tier } => {
                 let mut out = vec![5u8];
                 out.extend_from_slice(member.as_bytes());
-                let tier_bytes = tier.as_bytes();
-                out.extend_from_slice(&(tier_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(tier_bytes);
+                let tier_b = tier.as_bytes();
+                out.extend_from_slice(&(tier_b.len() as u16).to_be_bytes());
+                out.extend_from_slice(tier_b);
                 out
             }
             RosterOp::Remove { target } => {
                 let mut out = vec![2u8];
-                let target_bytes = target.as_bytes();
-                out.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(target_bytes);
+                out.extend_from_slice(target.as_bytes());
                 out
             }
             RosterOp::ChangeTier { target, new_tier } => {
                 let mut out = vec![3u8];
-                let target_bytes = target.as_bytes();
-                out.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(target_bytes);
-                let tier_bytes = new_tier.as_bytes();
-                out.extend_from_slice(&(tier_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(tier_bytes);
+                out.extend_from_slice(target.as_bytes());
+                let new_tier_b = new_tier.as_bytes();
+                out.extend_from_slice(&(new_tier_b.len() as u16).to_be_bytes());
+                out.extend_from_slice(new_tier_b);
                 out
             }
             RosterOp::DefineTier { name, permissions } => {
                 let mut out = vec![4u8];
-                let name_bytes = name.as_bytes();
-                out.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(name_bytes);
+                let name_b = name.as_bytes();
+                out.extend_from_slice(&(name_b.len() as u16).to_be_bytes());
+                out.extend_from_slice(name_b);
                 out.push(permissions.to_byte());
                 out
             }
@@ -447,7 +446,7 @@ impl RosterOp {
                         .map_err(|_| ChatError::InvalidPublicKey)?;
                     let tier_len = read_u16(&mut cursor)? as usize;
                     let tier = String::from_utf8(take(&mut cursor, tier_len)?)
-                        .map_err(|_| ChatError::MalformedMessage("bad member tier"))?;
+                        .map_err(|_| ChatError::MalformedMessage("bad tier"))?;
                     members.push((key, tier));
                 }
                 Ok(RosterOp::Genesis {
@@ -476,17 +475,13 @@ impl RosterOp {
                 Ok(RosterOp::AddBot { member, tier })
             }
             2 => {
-                let target_len = read_u16(&mut cursor)? as usize;
-                let target = String::from_utf8(take(&mut cursor, target_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad target"))?;
+                let target = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 Ok(RosterOp::Remove { target })
             }
             3 => {
-                let target_len = read_u16(&mut cursor)? as usize;
-                let target = String::from_utf8(take(&mut cursor, target_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad target"))?;
-                let tier_len = read_u16(&mut cursor)? as usize;
-                let new_tier = String::from_utf8(take(&mut cursor, tier_len)?)
+                let target = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
+                let new_tier_len = read_u16(&mut cursor)? as usize;
+                let new_tier = String::from_utf8(take(&mut cursor, new_tier_len)?)
                     .map_err(|_| ChatError::MalformedMessage("bad tier"))?;
                 Ok(RosterOp::ChangeTier { target, new_tier })
             }
@@ -518,7 +513,12 @@ pub struct SignedRosterOp {
 }
 
 impl SignedRosterOp {
-    fn signing_bytes(group_id: &str, version: u64, prev_hash: &[u8; 32], op: &RosterOp) -> Vec<u8> {
+    fn signing_bytes(
+        group_id: &GroupId,
+        version: u64,
+        prev_hash: &[u8; 32],
+        op: &RosterOp,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"symbolon/group/roster-op/v1");
         out.extend_from_slice(group_id.as_bytes());
@@ -595,7 +595,7 @@ impl Roster {
         for fp in &fingerprints {
             hasher.update(fp.as_bytes());
         }
-        let group_id: GroupId = hex_encode(&hasher.finalize());
+        let group_id = GroupId::from_bytes(hasher.finalize().into());
 
         let op = RosterOp::Genesis {
             kind,
@@ -608,7 +608,7 @@ impl Roster {
         let signature = creator.sign(&signing_bytes);
 
         let signed = SignedRosterOp {
-            group_id: group_id.clone(),
+            group_id,
             version: 0,
             prev_hash,
             op,
@@ -681,7 +681,7 @@ impl Roster {
             .iter()
             .map(|(id, m)| {
                 (
-                    id.clone(),
+                    *id,
                     self.tiers
                         .get(&m.tier)
                         .copied()
@@ -719,7 +719,7 @@ impl Roster {
         PeerRegistry::verify_signature(creator_key, &signing_bytes, &signed.signature)
             .map_err(|_| ChatError::RosterSignatureInvalid)?;
 
-        let mut roster = Roster::empty(signed.group_id.clone(), *kind, *relay);
+        let mut roster = Roster::empty(signed.group_id, *kind, *relay);
         for (name, perms) in tiers {
             roster.tiers.insert(name.clone(), *perms);
         }
@@ -827,7 +827,7 @@ impl Roster {
                         key: *member,
                         tier: tier.clone(),
                         kind: MemberKind::Bot,
-                        sponsor: Some(signed.proposer.clone()),
+                        sponsor: Some(signed.proposer),
                     },
                 );
             }
@@ -840,7 +840,7 @@ impl Roster {
                 // A bot lives only as long as its sponsor: drop theirs in the
                 // same step. Deterministic, so every node agrees.
                 self.members
-                    .retain(|_, m| m.sponsor.as_deref() != Some(target.as_str()));
+                    .retain(|_, m| m.sponsor.as_ref() != Some(target));
             }
             RosterOp::ChangeTier { target, new_tier } => {
                 if !(proposer_perms.can_add && proposer_perms.can_remove) {
@@ -898,7 +898,7 @@ impl Roster {
             SignedRosterOp::signing_bytes(&self.group_id, version, &self.tip_hash, &op);
         let signature = proposer.sign(&signing_bytes);
         Ok(SignedRosterOp {
-            group_id: self.group_id.clone(),
+            group_id: self.group_id,
             version,
             prev_hash: self.tip_hash,
             op,
@@ -1004,7 +1004,7 @@ impl Roster {
 
     /// The member who added `id` as a bot (`None` for people / non-members).
     pub fn sponsor_of(&self, id: &PeerId) -> Option<PeerId> {
-        self.members.get(id).and_then(|m| m.sponsor.clone())
+        self.members.get(id).and_then(|m| m.sponsor)
     }
 
     /// The effective permissions for a given member right now. Members not
@@ -1070,14 +1070,6 @@ fn tip_after(prev_hash: &[u8; 32], signed: &SignedRosterOp) -> [u8; 32] {
     hasher.update(signed.op.encode());
     hasher.update(signed.proposer.as_bytes());
     hasher.finalize().into()
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
 }
 
 /// Per-sender hash chain state, maintained by every recipient for every
@@ -1166,7 +1158,7 @@ impl OwnChainState {
 
     pub fn next_header(
         &mut self,
-        sender: &str,
+        sender: &PeerId,
         roster_version: u64,
         content_bytes: &[u8],
     ) -> (u64, [u8; 32]) {
@@ -1199,6 +1191,12 @@ pub enum GroupContent {
         target_sender: PeerId,
         target_seq: u64,
     },
+    /// "I am sharing this file": the signed offer (name, size, first bytes,
+    /// hash root). The bytes themselves are NOT in the message; members who
+    /// choose to accept pull them afterwards. See `docs/FILES.md`.
+    File {
+        offer: FileOffer,
+    },
 }
 
 impl GroupContent {
@@ -1223,10 +1221,13 @@ impl GroupContent {
                 target_seq,
             } => {
                 let mut out = vec![2u8];
-                let bytes = target_sender.as_bytes();
-                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(bytes);
+                out.extend_from_slice(target_sender.as_bytes());
                 out.extend_from_slice(&target_seq.to_be_bytes());
+                out
+            }
+            GroupContent::File { offer } => {
+                let mut out = vec![3u8];
+                out.extend_from_slice(&offer.encode());
                 out
             }
         }
@@ -1247,14 +1248,19 @@ impl GroupContent {
                 })
             }
             2 => {
-                let len = read_u16(&mut cursor)? as usize;
-                let target_sender = String::from_utf8(take(&mut cursor, len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad target sender"))?;
+                let target_sender = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let target_seq = read_u64(&mut cursor)?;
                 Ok(GroupContent::Delete {
                     target_sender,
                     target_seq,
                 })
+            }
+            3 => {
+                let offer = FileOffer::decode(cursor)?;
+                // Sanity-check at the door (sizes, chunk size, prefix). The
+                // receiver's own, lower size limit is applied when it accepts.
+                offer.validate(crate::file::HARD_MAX_FILE_SIZE)?;
+                Ok(GroupContent::File { offer })
             }
             _ => Err(ChatError::MalformedMessage("unknown group content tag")),
         }
@@ -1338,6 +1344,10 @@ pub enum GroupMessage {
         receiver: PeerId,
         signature: [u8; 64],
     },
+    /// One step of a file transfer (manifest or chunk request / answer),
+    /// pairwise between two members. Unsigned: what makes it trustworthy is
+    /// the signed offer's hash root and the authenticated session.
+    File(crate::file::FileFrame),
 }
 
 /// Flattened, encodable form of [`SignedRosterOp`].
@@ -1354,11 +1364,11 @@ pub struct RosterOpWire {
 impl From<&SignedRosterOp> for RosterOpWire {
     fn from(s: &SignedRosterOp) -> Self {
         RosterOpWire {
-            group_id: s.group_id.clone(),
+            group_id: s.group_id,
             version: s.version,
             prev_hash: s.prev_hash,
             op_bytes: s.op.encode(),
-            proposer: s.proposer.clone(),
+            proposer: s.proposer,
             signature_bytes: s.signature.to_bytes(),
         }
     }
@@ -1370,11 +1380,11 @@ impl RosterOpWire {
         let signature = Signature::from_slice(&self.signature_bytes)
             .map_err(|_| ChatError::MalformedMessage("bad roster signature encoding"))?;
         Ok(SignedRosterOp {
-            group_id: self.group_id.clone(),
+            group_id: self.group_id,
             version: self.version,
             prev_hash: self.prev_hash,
             op,
-            proposer: self.proposer.clone(),
+            proposer: self.proposer,
             signature,
         })
     }
@@ -1392,6 +1402,7 @@ const TAG_EXISTENCE: u8 = 0x14;
 const TAG_FETCH_REQUEST: u8 = 0x15;
 const TAG_RECEIPT: u8 = 0x16;
 const TAG_HAVE: u8 = 0x17;
+const TAG_FILE: u8 = 0x18;
 
 impl GroupMessage {
     pub fn encode(&self) -> Vec<u8> {
@@ -1405,9 +1416,7 @@ impl GroupMessage {
                 signature,
             } => {
                 let mut out = vec![TAG_APPLICATION];
-                let sender_bytes = sender.as_bytes();
-                out.extend_from_slice(&(sender_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(sender_bytes);
+                out.extend_from_slice(sender.as_bytes());
                 out.extend_from_slice(&seq.to_be_bytes());
                 out.extend_from_slice(prev_hash);
                 out.extend_from_slice(&roster_version.to_be_bytes());
@@ -1419,16 +1428,12 @@ impl GroupMessage {
             }
             GroupMessage::Roster(wire) => {
                 let mut out = vec![TAG_ROSTER];
-                let gid_bytes = wire.group_id.as_bytes();
-                out.extend_from_slice(&(gid_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(gid_bytes);
+                out.extend_from_slice(wire.group_id.as_bytes());
                 out.extend_from_slice(&wire.version.to_be_bytes());
                 out.extend_from_slice(&wire.prev_hash);
                 out.extend_from_slice(&(wire.op_bytes.len() as u32).to_be_bytes());
                 out.extend_from_slice(&wire.op_bytes);
-                let proposer_bytes = wire.proposer.as_bytes();
-                out.extend_from_slice(&(proposer_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(proposer_bytes);
+                out.extend_from_slice(wire.proposer.as_bytes());
                 out.extend_from_slice(&wire.signature_bytes);
                 out
             }
@@ -1446,7 +1451,6 @@ impl GroupMessage {
                 signature,
             } => {
                 let mut out = vec![TAG_EXISTENCE];
-                out.extend_from_slice(&(sender.len() as u16).to_be_bytes());
                 out.extend_from_slice(sender.as_bytes());
                 out.extend_from_slice(&seq.to_be_bytes());
                 out.extend_from_slice(prev_hash);
@@ -1464,36 +1468,35 @@ impl GroupMessage {
                 signature,
             } => {
                 let mut out = vec![TAG_RECEIPT];
-                out.extend_from_slice(&(author.len() as u16).to_be_bytes());
                 out.extend_from_slice(author.as_bytes());
                 out.extend_from_slice(&seq.to_be_bytes());
                 out.extend_from_slice(content_hash);
                 out.push(kind.to_byte());
-                out.extend_from_slice(&(receiver.len() as u16).to_be_bytes());
                 out.extend_from_slice(receiver.as_bytes());
                 out.extend_from_slice(signature);
                 out
             }
             GroupMessage::FetchRequest { sender, seq } => {
                 let mut out = vec![TAG_FETCH_REQUEST];
-                out.extend_from_slice(&(sender.len() as u16).to_be_bytes());
                 out.extend_from_slice(sender.as_bytes());
                 out.extend_from_slice(&seq.to_be_bytes());
                 out
             }
             GroupMessage::Have { sender, seq } => {
                 let mut out = vec![TAG_HAVE];
-                out.extend_from_slice(&(sender.len() as u16).to_be_bytes());
                 out.extend_from_slice(sender.as_bytes());
                 out.extend_from_slice(&seq.to_be_bytes());
                 out
             }
             GroupMessage::RelayRequest { sender, after_seq } => {
                 let mut out = vec![TAG_RELAY_REQUEST];
-                let sender_bytes = sender.as_bytes();
-                out.extend_from_slice(&(sender_bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(sender_bytes);
+                out.extend_from_slice(sender.as_bytes());
                 out.extend_from_slice(&after_seq.to_be_bytes());
+                out
+            }
+            GroupMessage::File(frame) => {
+                let mut out = vec![TAG_FILE];
+                out.extend_from_slice(&frame.encode());
                 out
             }
         }
@@ -1504,9 +1507,7 @@ impl GroupMessage {
         let tag = take(&mut cursor, 1)?[0];
         match tag {
             TAG_APPLICATION => {
-                let sender_len = read_u16(&mut cursor)? as usize;
-                let sender = String::from_utf8(take(&mut cursor, sender_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad sender id"))?;
+                let sender = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let seq = read_u64(&mut cursor)?;
                 let prev_hash: [u8; 32] = take(&mut cursor, 32)?.try_into().unwrap();
                 let roster_version = read_u64(&mut cursor)?;
@@ -1524,16 +1525,12 @@ impl GroupMessage {
                 })
             }
             TAG_ROSTER => {
-                let gid_len = read_u16(&mut cursor)? as usize;
-                let group_id = String::from_utf8(take(&mut cursor, gid_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad group id"))?;
+                let group_id = GroupId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let version = read_u64(&mut cursor)?;
                 let prev_hash: [u8; 32] = take(&mut cursor, 32)?.try_into().unwrap();
                 let op_len = read_u32(&mut cursor)? as usize;
                 let op_bytes = take(&mut cursor, op_len)?;
-                let proposer_len = read_u16(&mut cursor)? as usize;
-                let proposer = String::from_utf8(take(&mut cursor, proposer_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad proposer id"))?;
+                let proposer = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let signature_bytes: [u8; 64] = take(&mut cursor, 64)?.try_into().unwrap();
                 Ok(GroupMessage::Roster(RosterOpWire {
                     group_id,
@@ -1544,27 +1541,22 @@ impl GroupMessage {
                     signature_bytes,
                 }))
             }
+            TAG_FILE => Ok(GroupMessage::File(crate::file::FileFrame::decode(cursor)?)),
             TAG_ROSTER_SYNC_REQUEST => Ok(GroupMessage::RosterSyncRequest {
                 have_version: read_u64(&mut cursor)?,
             }),
             TAG_HAVE => {
-                let sender_len = read_u16(&mut cursor)? as usize;
-                let sender = String::from_utf8(take(&mut cursor, sender_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad sender id"))?;
+                let sender = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let seq = read_u64(&mut cursor)?;
                 Ok(GroupMessage::Have { sender, seq })
             }
             TAG_RELAY_REQUEST => {
-                let sender_len = read_u16(&mut cursor)? as usize;
-                let sender = String::from_utf8(take(&mut cursor, sender_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad sender id"))?;
+                let sender = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let after_seq = read_u64(&mut cursor)?;
                 Ok(GroupMessage::RelayRequest { sender, after_seq })
             }
             TAG_EXISTENCE => {
-                let sender_len = read_u16(&mut cursor)? as usize;
-                let sender = String::from_utf8(take(&mut cursor, sender_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad sender id"))?;
+                let sender = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let seq = read_u64(&mut cursor)?;
                 let prev_hash: [u8; 32] = take(&mut cursor, 32)?.try_into().unwrap();
                 let roster_version = read_u64(&mut cursor)?;
@@ -1580,15 +1572,11 @@ impl GroupMessage {
                 })
             }
             TAG_RECEIPT => {
-                let author_len = read_u16(&mut cursor)? as usize;
-                let author = String::from_utf8(take(&mut cursor, author_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad author id"))?;
+                let author = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let seq = read_u64(&mut cursor)?;
                 let content_hash: [u8; 32] = take(&mut cursor, 32)?.try_into().unwrap();
                 let kind = ReceiptKind::from_byte(take(&mut cursor, 1)?[0])?;
-                let receiver_len = read_u16(&mut cursor)? as usize;
-                let receiver = String::from_utf8(take(&mut cursor, receiver_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad receiver id"))?;
+                let receiver = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let signature: [u8; 64] = take(&mut cursor, 64)?.try_into().unwrap();
                 Ok(GroupMessage::Receipt {
                     author,
@@ -1600,9 +1588,7 @@ impl GroupMessage {
                 })
             }
             TAG_FETCH_REQUEST => {
-                let sender_len = read_u16(&mut cursor)? as usize;
-                let sender = String::from_utf8(take(&mut cursor, sender_len)?)
-                    .map_err(|_| ChatError::MalformedMessage("bad sender id"))?;
+                let sender = PeerId::from_bytes(take(&mut cursor, 32)?.try_into().unwrap());
                 let seq = read_u64(&mut cursor)?;
                 Ok(GroupMessage::FetchRequest { sender, seq })
             }
@@ -1616,7 +1602,7 @@ impl GroupMessage {
     /// a member prove "X said something at position N" (an existence notice)
     /// without disclosing the content.
     pub(crate) fn header_bytes(
-        sender: &str,
+        sender: &PeerId,
         seq: u64,
         prev_hash: &[u8; 32],
         roster_version: u64,
@@ -1634,14 +1620,13 @@ impl GroupMessage {
     /// [`GroupMessage::header_bytes`] when only the content's hash is known
     /// (an existence notice).
     pub(crate) fn header_from_hash(
-        sender: &str,
+        sender: &PeerId,
         seq: u64,
         prev_hash: &[u8; 32],
         roster_version: u64,
         content_hash: &[u8; 32],
     ) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(sender.len() as u16).to_be_bytes());
         out.extend_from_slice(sender.as_bytes());
         out.extend_from_slice(&seq.to_be_bytes());
         out.extend_from_slice(prev_hash);
@@ -1652,8 +1637,8 @@ impl GroupMessage {
 
     /// The exact bytes an author signs: a domain label, the group, and the header.
     pub(crate) fn signing_bytes(
-        group_id: &str,
-        sender: &str,
+        group_id: &GroupId,
+        sender: &PeerId,
         seq: u64,
         prev_hash: &[u8; 32],
         roster_version: u64,
@@ -1671,8 +1656,8 @@ impl GroupMessage {
 
     /// [`GroupMessage::signing_bytes`] from the content hash alone.
     pub(crate) fn signing_bytes_from_hash(
-        group_id: &str,
-        sender: &str,
+        group_id: &GroupId,
+        sender: &PeerId,
         seq: u64,
         prev_hash: &[u8; 32],
         roster_version: u64,
@@ -1680,7 +1665,6 @@ impl GroupMessage {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"symbolon/group/application/v2");
-        out.extend_from_slice(&(group_id.len() as u16).to_be_bytes());
         out.extend_from_slice(group_id.as_bytes());
         out.extend_from_slice(&Self::header_from_hash(
             sender,
@@ -1695,19 +1679,18 @@ impl GroupMessage {
     /// What a receiver signs: label, group, who wrote the message, which
     /// message, the hash of its content, what kind of receipt, and who signs.
     pub(crate) fn receipt_signing_bytes(
-        group_id: &str,
-        author: &str,
+        group_id: &GroupId,
+        author: &PeerId,
         seq: u64,
         content_hash: &[u8; 32],
         kind: ReceiptKind,
-        receiver: &str,
+        receiver: &PeerId,
     ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"symbolon/group/receipt/v1");
-        for part in [group_id, author, receiver] {
-            out.extend_from_slice(&(part.len() as u16).to_be_bytes());
-            out.extend_from_slice(part.as_bytes());
-        }
+        out.extend_from_slice(group_id.as_bytes());
+        out.extend_from_slice(author.as_bytes());
+        out.extend_from_slice(receiver.as_bytes());
         out.extend_from_slice(&seq.to_be_bytes());
         out.extend_from_slice(content_hash);
         out.push(kind.to_byte());
@@ -1800,6 +1783,32 @@ pub enum GroupEvent {
         seq: u64,
         kind: ReceiptKind,
     },
+    /// `sender` is offering a file (message `seq`). Nothing has been
+    /// downloaded: show the name, size and type, and call
+    /// [`GroupHub::accept_file`] if the person says yes. Ignoring it, or
+    /// [`GroupHub::decline_file`], costs nothing and tells nobody.
+    FileOffered {
+        sender: PeerId,
+        seq: u64,
+        offer: FileOffer,
+    },
+    /// Download progress for `author`'s file `seq` (sent when the whole
+    /// percentage changes, and on completion).
+    FileProgress {
+        author: PeerId,
+        seq: u64,
+        done: u32,
+        total: u32,
+    },
+    /// Every chunk is verified and the sink has been finished.
+    FileComplete { author: PeerId, seq: u64 },
+    /// The download stopped: `reason` says why. The sink keeps whatever was
+    /// verified, so an app may start again.
+    FileFailed {
+        author: PeerId,
+        seq: u64,
+        reason: &'static str,
+    },
 }
 
 struct StoredMessage {
@@ -1838,6 +1847,12 @@ pub struct GroupHubConfig {
     /// on it - e.g. a single-threaded async executor, where spawning raw
     /// OS threads defeats the point.
     pub auto_pump: bool,
+    /// Largest file this hub will agree to download (default 1 GiB; the
+    /// ceiling is 4 GiB, see [`crate::file::HARD_MAX_FILE_SIZE`]). Bigger
+    /// offers are still shown, but [`GroupHub::accept_file`] refuses them.
+    pub max_file_size: u64,
+    /// How many downloads may run at once (default 4).
+    pub max_concurrent_downloads: usize,
 }
 
 impl Default for GroupHubConfig {
@@ -1848,6 +1863,8 @@ impl Default for GroupHubConfig {
             tracer: Arc::new(crate::trace::NoopTracer),
             relayed_content: RelayedContent::Deliver,
             receipts: ReceiptSettings::default(),
+            max_file_size: crate::file::DEFAULT_MAX_FILE_SIZE,
+            max_concurrent_downloads: 4,
         }
     }
 }
@@ -1901,6 +1918,16 @@ pub struct GroupHub {
     /// [`GroupMessage::Have`]; limits how fast a chatty (or hostile) member
     /// can make us send requests.
     have_requested: Mutex<HashMap<PeerId, std::time::Instant>>,
+    /// Authors for which a delayed follow-up request is already scheduled
+    /// (see [`GroupHub::request_after_have`]); at most one per author. The
+    /// value is the most recent announcer and the HIGHEST sequence number
+    /// announced so far, so the follow-up asks for everything announced
+    /// meanwhile, not just the first announcement.
+    have_followup: Mutex<HashMap<PeerId, (PeerId, u64)>>,
+    /// Offers, served files and running downloads: see `group/files.rs`.
+    files: Mutex<files::FileState>,
+    /// A handle to ourselves, so an event can schedule one delayed follow-up.
+    me: Mutex<std::sync::Weak<GroupHub>>,
     /// Set while replaying a persisted log at startup, so already-persisted
     /// records don't get appended to the log a second time.
     replaying: std::sync::atomic::AtomicBool,
@@ -1933,9 +1960,9 @@ impl GroupHub {
     /// synchronously inside whatever call happens to be blocked in
     /// `recv_event`, `GroupHub` runs its validation/roster-application/
     /// relay-response logic on a dedicated background thread *continuously*
-    /// - the same way `Session` already handles acks and resends in its own
+    /// (the same way `Session` already handles acks and resends in its own
     /// background thread regardless of whether the application is actively
-    /// reading. This matters specifically for relaying: another member's
+    /// reading). This matters specifically for relaying: another member's
     /// `RelayRequest` needs to be answered whether or not *this* member's
     /// application happens to be mid-`recv_event` at that exact moment.
     pub fn with_config(
@@ -2057,7 +2084,7 @@ impl GroupHub {
             // the message store, and roster state identically to how they
             // stood live, using one code path for both "just happened" and
             // "happened before I restarted".
-            let _ = hub.process_incoming(hub.own_id.clone(), record.clone());
+            let _ = hub.process_incoming(hub.own_id, record.clone());
         }
         hub.replaying
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2118,7 +2145,11 @@ impl GroupHub {
             persist_failed: std::sync::atomic::AtomicBool::new(false),
             pending_ahead: Mutex::new(Vec::new()),
             have_requested: Mutex::new(HashMap::new()),
+            have_followup: Mutex::new(HashMap::new()),
+            files: Mutex::new(files::FileState::default()),
+            me: Mutex::new(std::sync::Weak::new()),
         });
+        *hub.me.lock().unwrap() = Arc::downgrade(&hub);
 
         if auto_pump {
             let hub_for_thread = Arc::clone(&hub);
@@ -2152,16 +2183,16 @@ impl GroupHub {
         self.sessions
             .lock()
             .unwrap()
-            .insert(peer_id.clone(), Arc::clone(&session));
+            .insert(peer_id, Arc::clone(&session));
 
         if self.config.auto_pump {
             let tx = self.merged_tx.clone();
             let session_for_thread = Arc::clone(&session);
-            let peer_id_for_thread = peer_id.clone();
+            let peer_id_for_thread = peer_id;
             std::thread::spawn(move || loop {
                 match session_for_thread.recv() {
                     Ok(bytes) => {
-                        if tx.send((peer_id_for_thread.clone(), bytes)).is_err() {
+                        if tx.send((peer_id_for_thread, bytes)).is_err() {
                             return;
                         }
                     }
@@ -2255,7 +2286,7 @@ impl GroupHub {
         let sender = identity.fingerprint();
         let (group_id, roster_version) = {
             let r = self.roster.lock().unwrap();
-            (r.group_id.clone(), r.version())
+            (r.group_id, r.version())
         };
         let (seq, prev_hash) =
             self.own_chain
@@ -2272,7 +2303,7 @@ impl GroupHub {
         );
         let signature = identity.sign(&signing_bytes).to_bytes();
         let msg = GroupMessage::Application {
-            sender: sender.clone(),
+            sender,
             seq,
             prev_hash,
             roster_version,
@@ -2287,7 +2318,7 @@ impl GroupHub {
         self.content_hashes
             .lock()
             .unwrap()
-            .insert((sender.clone(), seq), Sha256::digest(&content_bytes).into());
+            .insert((sender, seq), Sha256::digest(&content_bytes).into());
         self.persist(&wire);
         self.apply_content_locally(&sender, seq, &self.get_content(&msg));
 
@@ -2317,9 +2348,91 @@ impl GroupHub {
     }
 
     /// Trace a dropped group message and return `None` (for `?`-style exits).
+    /// Someone told us (via `Have`) that they hold message `seq` of `sender`,
+    /// which we lack. Ask them for what we are missing, but do not let a flood
+    /// of announcements become a flood of requests: at most one request per
+    /// author per 300 ms.
+    ///
+    /// A request that is merely DROPPED when it comes too soon would lose the
+    /// announcement: if it was the last one, nothing would ever prompt us
+    /// again and the message would stall. So a too-soon announcement instead
+    /// schedules ONE follow-up request for when the window ends (a single
+    /// short-lived thread per author, started by the event, not a poll). The
+    /// follow-up re-checks whether we still lack the message and does nothing
+    /// if it has arrived meanwhile.
+    fn request_after_have(&self, sender: PeerId, arrival_peer: PeerId, seq: u64) {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+        let now = std::time::Instant::now();
+        let too_soon = {
+            let mut last = self.have_requested.lock().unwrap();
+            match last.get(&sender) {
+                Some(t) if now.duration_since(*t) < WINDOW => Some(WINDOW - now.duration_since(*t)),
+                _ => {
+                    if last.len() > 1024 {
+                        last.clear(); // bounded; worst case is one extra request
+                    }
+                    last.insert(sender, now);
+                    None
+                }
+            }
+        };
+        let Some(remaining) = too_soon else {
+            self.send_relay_request(&sender, &arrival_peer, seq);
+            return;
+        };
+        {
+            let mut pending = self.have_followup.lock().unwrap();
+            if let Some(entry) = pending.get_mut(&sender) {
+                // A follow-up is already on its way: just widen what it asks for.
+                entry.1 = entry.1.max(seq);
+                entry.0 = arrival_peer;
+                return;
+            }
+            pending.insert(sender, (arrival_peer, seq));
+        }
+        let Some(hub) = self.me.lock().unwrap().upgrade() else {
+            self.have_followup.lock().unwrap().remove(&sender);
+            return;
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(remaining + std::time::Duration::from_millis(10));
+            let Some((peer, want)) = hub.have_followup.lock().unwrap().remove(&sender) else {
+                return;
+            };
+            hub.have_requested
+                .lock()
+                .unwrap()
+                .insert(sender, std::time::Instant::now());
+            hub.send_relay_request(&sender, &peer, want);
+        });
+    }
+
+    /// Send `peer` a `RelayRequest` for everything after what we hold of
+    /// `sender`, but only if we still lack `seq` (it may have arrived since).
+    fn send_relay_request(&self, sender: &PeerId, peer: &PeerId, seq: u64) {
+        let have_up_to = self
+            .sender_chains
+            .lock()
+            .unwrap()
+            .get(sender)
+            .map(|c| c.next_seq_hint())
+            .unwrap_or(0);
+        if seq <= have_up_to {
+            return;
+        }
+        let request = GroupMessage::RelayRequest {
+            sender: *sender,
+            after_seq: have_up_to,
+        }
+        .encode();
+        if let Some(session) = self.sessions.lock().unwrap().get(peer) {
+            let _ = session.send(&request);
+        }
+    }
+
     fn reject(&self, author: &PeerId, reason: &'static str) -> Option<GroupEvent> {
         self.trace(TraceEvent::GroupMessageRejected {
-            author: author.clone(),
+            author: *author,
             reason,
         });
         None
@@ -2348,7 +2461,7 @@ impl GroupHub {
 
     fn cache_for_relay(&self, sender: &PeerId, seq: u64, wire: &[u8]) {
         let mut cache = self.relay_cache.lock().unwrap();
-        let per_sender = cache.entry(sender.clone()).or_default();
+        let per_sender = cache.entry(*sender).or_default();
         per_sender.insert(seq, wire.to_vec());
         while per_sender.len() > self.config.relay_cache_capacity_per_sender {
             if let Some(&oldest) = per_sender.keys().next() {
@@ -2371,7 +2484,7 @@ impl GroupHub {
         let mut store = self.message_store.lock().unwrap();
         match content {
             GroupContent::Post { payload } => {
-                store.entry(sender.clone()).or_default().insert(
+                store.entry(*sender).or_default().insert(
                     seq,
                     StoredMessage {
                         payload: payload.clone(),
@@ -2380,7 +2493,7 @@ impl GroupHub {
                     },
                 );
                 Some(GroupEvent::Message {
-                    sender: sender.clone(),
+                    sender: *sender,
                     seq,
                     payload: payload.clone(),
                 })
@@ -2389,7 +2502,10 @@ impl GroupHub {
                 target_seq,
                 new_payload,
             } => {
-                let author_messages = store.entry(sender.clone()).or_default();
+                if self.is_file_offer(sender, *target_seq) {
+                    return None; // a file offer cannot be edited into something else
+                }
+                let author_messages = store.entry(*sender).or_default();
                 if let Some(stored) = author_messages.get_mut(target_seq) {
                     if stored.deleted {
                         return None; // can't edit something already deleted
@@ -2397,7 +2513,7 @@ impl GroupHub {
                     stored.payload = new_payload.clone();
                     stored.edited = true;
                     Some(GroupEvent::MessageEdited {
-                        author: sender.clone(),
+                        author: *sender,
                         seq: *target_seq,
                         new_payload: new_payload.clone(),
                     })
@@ -2409,18 +2525,37 @@ impl GroupHub {
                 target_sender,
                 target_seq,
             } => {
-                let author_messages = store.entry(target_sender.clone()).or_default();
+                let author_messages = store.entry(*target_sender).or_default();
                 if let Some(stored) = author_messages.get_mut(target_seq) {
                     stored.deleted = true;
                     stored.payload.clear();
+                    // A deleted file offer stops being served and its
+                    // download (if any) is cancelled.
+                    self.forget_file_offer(target_sender, *target_seq);
                     Some(GroupEvent::MessageDeleted {
-                        author: target_sender.clone(),
+                        author: *target_sender,
                         seq: *target_seq,
-                        deleted_by: sender.clone(),
+                        deleted_by: *sender,
                     })
                 } else {
                     None
                 }
+            }
+            GroupContent::File { offer } => {
+                store.entry(*sender).or_default().insert(
+                    seq,
+                    StoredMessage {
+                        payload: offer.encode(),
+                        edited: false,
+                        deleted: false,
+                    },
+                );
+                self.remember_file_offer(*sender, seq, offer.clone());
+                Some(GroupEvent::FileOffered {
+                    sender: *sender,
+                    seq,
+                    offer: offer.clone(),
+                })
             }
         }
     }
@@ -2597,14 +2732,12 @@ impl GroupHub {
                         return self.reject(&sender, "unknown author");
                     };
                     match roster.permissions_at(roster_version, &sender) {
-                        Some(perms) => (key, perms, roster.group_id.clone()),
+                        Some(perms) => (key, perms, roster.group_id),
                         None => {
                             // The author's version is ahead of ours: we are
                             // missing a roster op and cannot judge yet. Park it.
                             drop(roster);
-                            self.trace(TraceEvent::GroupMessageDeferred {
-                                author: sender.clone(),
-                            });
+                            self.trace(TraceEvent::GroupMessageDeferred { author: sender });
                             self.defer(arrival_peer, bytes);
                             return None;
                         }
@@ -2612,7 +2745,9 @@ impl GroupHub {
                 };
 
                 let required_ok = match &content {
-                    GroupContent::Post { .. } | GroupContent::Edit { .. } => author_perms.can_write,
+                    GroupContent::Post { .. }
+                    | GroupContent::Edit { .. }
+                    | GroupContent::File { .. } => author_perms.can_write,
                     GroupContent::Delete { target_sender, .. } => {
                         if *target_sender == sender {
                             author_perms.can_write
@@ -2644,6 +2779,45 @@ impl GroupHub {
                 }
 
                 let content_hash: [u8; 32] = Sha256::digest(content.encode()).into();
+
+                // Already have this sequence number from this author? In a
+                // mesh the same message can legitimately arrive twice (the
+                // author's own copy, and a copy fetched after a `Have`).
+                // Identical content: ignore it quietly. DIFFERENT content
+                // under the same signed number is something else: the
+                // author signed two versions (equivocation), so reject it
+                // loudly instead of hiding it as a duplicate.
+                let already_consumed = self
+                    .sender_chains
+                    .lock()
+                    .unwrap()
+                    .get(&sender)
+                    .map(|c| seq <= c.next_seq_hint())
+                    .unwrap_or(false);
+                if already_consumed {
+                    let held = self
+                        .content_hashes
+                        .lock()
+                        .unwrap()
+                        .get(&(sender, seq))
+                        .copied();
+                    match held {
+                        Some(h) if h == content_hash => {
+                            self.trace(TraceEvent::GroupMessageDuplicate {
+                                author: sender,
+                                seq,
+                            });
+                            return None;
+                        }
+                        Some(_) => {
+                            return self.reject(
+                                &sender,
+                                "conflicting content for an already-held sequence number",
+                            );
+                        }
+                        None => {} // header-only so far: handled by the steps below
+                    }
+                }
                 // Replay (arrival == us) is never "relayed"; neither is a
                 // message straight from its author.
                 let relayed = arrival_peer != sender && arrival_peer != self.own_id;
@@ -2655,7 +2829,7 @@ impl GroupHub {
                     .pending_existence
                     .lock()
                     .unwrap()
-                    .get(&(sender.clone(), seq))
+                    .get(&(sender, seq))
                     .copied();
                 if let Some(expected) = expected {
                     if expected != content_hash {
@@ -2667,17 +2841,17 @@ impl GroupHub {
                     self.pending_existence
                         .lock()
                         .unwrap()
-                        .remove(&(sender.clone(), seq));
+                        .remove(&(sender, seq));
                     if relayed {
                         self.relayed_by
                             .lock()
                             .unwrap()
-                            .insert((sender.clone(), seq), arrival_peer.clone());
+                            .insert((sender, seq), arrival_peer);
                     }
                     self.cache_for_relay(&sender, seq, &bytes);
                     self.persist(&bytes);
                     self.trace(TraceEvent::ContentFilled {
-                        author: sender.clone(),
+                        author: sender,
                         seq,
                     });
                     self.note_held(&sender, seq, content_hash, &content, &arrival_peer);
@@ -2698,7 +2872,7 @@ impl GroupHub {
                 if hide {
                     {
                         let mut chains = self.sender_chains.lock().unwrap();
-                        let chain = chains.entry(sender.clone()).or_default();
+                        let chain = chains.entry(sender).or_default();
                         if chain
                             .verify_and_advance(seq, prev_hash, roster_version, &header)
                             .is_err()
@@ -2710,9 +2884,9 @@ impl GroupHub {
                     self.pending_existence
                         .lock()
                         .unwrap()
-                        .insert((sender.clone(), seq), content_hash);
+                        .insert((sender, seq), content_hash);
                     let notice = GroupMessage::Existence {
-                        sender: sender.clone(),
+                        sender,
                         seq,
                         prev_hash,
                         roster_version,
@@ -2722,7 +2896,7 @@ impl GroupHub {
                     .encode();
                     self.persist(&notice);
                     self.trace(TraceEvent::ExistenceRecorded {
-                        author: sender.clone(),
+                        author: sender,
                         seq,
                     });
                     return Some(GroupEvent::Existence {
@@ -2734,7 +2908,7 @@ impl GroupHub {
                 // (3) Normal acceptance.
                 {
                     let mut chains = self.sender_chains.lock().unwrap();
-                    let chain = chains.entry(sender.clone()).or_default();
+                    let chain = chains.entry(sender).or_default();
                     if chain
                         .verify_and_advance(seq, prev_hash, roster_version, &header)
                         .is_err()
@@ -2753,10 +2927,10 @@ impl GroupHub {
                     self.relayed_by
                         .lock()
                         .unwrap()
-                        .insert((sender.clone(), seq), arrival_peer.clone());
+                        .insert((sender, seq), arrival_peer);
                 }
                 self.trace(TraceEvent::GroupMessageAccepted {
-                    author: sender.clone(),
+                    author: sender,
                     seq,
                 });
                 self.note_held(&sender, seq, content_hash, &content, &arrival_peer);
@@ -2814,12 +2988,10 @@ impl GroupHub {
                         return self.reject(&sender, "unknown author");
                     };
                     match roster.permissions_at(roster_version, &sender) {
-                        Some(perms) => (key, perms, roster.group_id.clone()),
+                        Some(perms) => (key, perms, roster.group_id),
                         None => {
                             drop(roster);
-                            self.trace(TraceEvent::GroupMessageDeferred {
-                                author: sender.clone(),
-                            });
+                            self.trace(TraceEvent::GroupMessageDeferred { author: sender });
                             self.defer(arrival_peer, bytes);
                             return None;
                         }
@@ -2857,7 +3029,7 @@ impl GroupHub {
                 );
                 {
                     let mut chains = self.sender_chains.lock().unwrap();
-                    let chain = chains.entry(sender.clone()).or_default();
+                    let chain = chains.entry(sender).or_default();
                     if chain.next_seq() > seq {
                         return None; // already accounted for (content or earlier notice)
                     }
@@ -2872,10 +3044,10 @@ impl GroupHub {
                 self.pending_existence
                     .lock()
                     .unwrap()
-                    .insert((sender.clone(), seq), content_hash);
+                    .insert((sender, seq), content_hash);
                 self.persist(&bytes);
                 self.trace(TraceEvent::ExistenceRecorded {
-                    author: sender.clone(),
+                    author: sender,
                     seq,
                 });
                 Some(GroupEvent::Existence {
@@ -2896,7 +3068,7 @@ impl GroupHub {
                 }
                 let (key, group_id) = {
                     let r = self.roster.lock().unwrap();
-                    (r.key_ever(&receiver), r.group_id.clone())
+                    (r.key_ever(&receiver), r.group_id)
                 };
                 let Some(key) = key else {
                     return self.reject(&receiver, "receipt from unknown member");
@@ -2920,7 +3092,7 @@ impl GroupHub {
                     .content_hashes
                     .lock()
                     .unwrap()
-                    .get(&(self.own_id.clone(), seq))
+                    .get(&(self.own_id, seq))
                     .copied();
                 if ours != Some(content_hash) {
                     return self.reject(&receiver, "receipt for content we did not send");
@@ -2929,8 +3101,8 @@ impl GroupHub {
                     let mut all = self.receipts.lock().unwrap();
                     let entry = all.entry(seq).or_default();
                     let best = entry.get(&receiver).copied();
-                    if best.map_or(true, |b| kind > b) {
-                        entry.insert(receiver.clone(), kind);
+                    if best.is_none_or(|b| kind > b) {
+                        entry.insert(receiver, kind);
                     } else {
                         return None; // nothing new
                     }
@@ -2941,6 +3113,10 @@ impl GroupHub {
                     seq,
                     kind,
                 })
+            }
+            GroupMessage::File(frame) => {
+                self.handle_file_frame(arrival_peer, frame);
+                None
             }
             GroupMessage::FetchRequest { sender, seq } => {
                 // Serving content is where the `can_read` permission is
@@ -2994,29 +3170,7 @@ impl GroupHub {
                 if seq <= have_up_to {
                     return None;
                 }
-                // Debounce: one request per author per 300 ms, however many
-                // announcements arrive.
-                {
-                    let mut last = self.have_requested.lock().unwrap();
-                    let now = std::time::Instant::now();
-                    if let Some(t) = last.get(&sender) {
-                        if now.duration_since(*t) < std::time::Duration::from_millis(300) {
-                            return None;
-                        }
-                    }
-                    if last.len() > 1024 {
-                        last.clear(); // bounded; worst case is one extra request
-                    }
-                    last.insert(sender.clone(), now);
-                }
-                let request = GroupMessage::RelayRequest {
-                    sender,
-                    after_seq: have_up_to,
-                }
-                .encode();
-                if let Some(session) = self.sessions.lock().unwrap().get(&arrival_peer) {
-                    let _ = session.send(&request);
-                }
+                self.request_after_have(sender, arrival_peer, seq);
                 None
             }
             GroupMessage::RelayRequest { sender, after_seq } => {
@@ -3073,7 +3227,7 @@ impl GroupHub {
             return;
         }
         let wire = GroupMessage::Have {
-            sender: author.clone(),
+            sender: *author,
             seq,
         }
         .encode();
@@ -3103,12 +3257,15 @@ impl GroupHub {
         self.content_hashes
             .lock()
             .unwrap()
-            .insert((author.clone(), seq), content_hash);
+            .insert((*author, seq), content_hash);
         let live = *arrival_peer != self.own_id;
         if live
             && *author != self.own_id
             && self.config.receipts.delivery
-            && matches!(content, GroupContent::Post { .. })
+            && matches!(
+                content,
+                GroupContent::Post { .. } | GroupContent::File { .. }
+            )
         {
             let _ = self.send_receipt(author, seq, ReceiptKind::Delivered);
         }
@@ -3125,12 +3282,12 @@ impl GroupHub {
             .content_hashes
             .lock()
             .unwrap()
-            .get(&(author.clone(), seq))
+            .get(&(*author, seq))
             .copied()
         else {
             return Ok(false);
         };
-        let group_id = self.roster.lock().unwrap().group_id.clone();
+        let group_id = self.roster.lock().unwrap().group_id;
         let signing = GroupMessage::receipt_signing_bytes(
             &group_id,
             author,
@@ -3140,11 +3297,11 @@ impl GroupHub {
             &self.own_id,
         );
         let wire = GroupMessage::Receipt {
-            author: author.clone(),
+            author: *author,
             seq,
             content_hash,
             kind,
-            receiver: self.own_id.clone(),
+            receiver: self.own_id,
             signature: signer(&signing),
         }
         .encode();
@@ -3185,7 +3342,7 @@ impl GroupHub {
             .lock()
             .unwrap()
             .get(&seq)
-            .map(|m| m.iter().map(|(p, k)| (p.clone(), *k)).collect())
+            .map(|m| m.iter().map(|(p, k)| (*p, *k)).collect())
             .unwrap_or_default();
         v.sort();
         v
@@ -3215,7 +3372,7 @@ impl GroupHub {
     /// [`GroupHub::fetch_from_anyone`].
     pub fn fetch(&self, author: &PeerId, seq: u64) -> Result<()> {
         let request = GroupMessage::FetchRequest {
-            sender: author.clone(),
+            sender: *author,
             seq,
         }
         .encode();
@@ -3237,7 +3394,7 @@ impl GroupHub {
     /// answer with notices only, so this helps only in open groups.
     pub fn fetch_from_anyone(&self, author: &PeerId, seq: u64) -> Result<()> {
         let request = GroupMessage::FetchRequest {
-            sender: author.clone(),
+            sender: *author,
             seq,
         }
         .encode();
@@ -3273,7 +3430,7 @@ impl GroupHub {
         self.relayed_by
             .lock()
             .unwrap()
-            .get(&(author.clone(), seq))
+            .get(&(*author, seq))
             .cloned()
     }
 
@@ -3323,7 +3480,7 @@ impl GroupHub {
 
     /// The group's permanent identifier.
     pub fn group_id(&self) -> GroupId {
-        self.roster.lock().unwrap().group_id.clone()
+        self.roster.lock().unwrap().group_id
     }
 
     /// Public keys of all current members.
@@ -3781,7 +3938,7 @@ mod tests {
         let mallory = Identity::generate();
         let (mut roster, _genesis) = Roster::genesis_default(&alice, vec![]);
         let forged = SignedRosterOp {
-            group_id: roster.group_id.clone(),
+            group_id: roster.group_id,
             version: roster.version() + 1,
             prev_hash: roster.tip_hash,
             op: RosterOp::Add {
@@ -3819,7 +3976,7 @@ mod tests {
     #[test]
     fn delete_content_round_trips() {
         let content = GroupContent::Delete {
-            target_sender: "abc123".to_string(),
+            target_sender: PeerId::from_bytes([1u8; 32]),
             target_seq: 9,
         };
         assert_eq!(GroupContent::decode(&content.encode()).unwrap(), content);
@@ -3828,7 +3985,7 @@ mod tests {
     #[test]
     fn application_message_round_trips() {
         let msg = GroupMessage::Application {
-            sender: "deadbeef".to_string(),
+            sender: PeerId::from_bytes([2u8; 32]),
             seq: 5,
             prev_hash: [7u8; 32],
             roster_version: 3,
@@ -3843,7 +4000,7 @@ mod tests {
     #[test]
     fn relay_request_round_trips() {
         let msg = GroupMessage::RelayRequest {
-            sender: "abc".to_string(),
+            sender: PeerId::from_bytes([3u8; 32]),
             after_seq: 42,
         };
         assert_eq!(GroupMessage::decode(&msg.encode()).unwrap(), msg);
@@ -3852,7 +4009,7 @@ mod tests {
     #[test]
     fn existence_and_fetch_messages_round_trip() {
         let n = GroupMessage::Existence {
-            sender: "abc".into(),
+            sender: PeerId::from_bytes([3u8; 32]),
             seq: 7,
             prev_hash: [1; 32],
             roster_version: 3,
@@ -3861,7 +4018,7 @@ mod tests {
         };
         assert_eq!(GroupMessage::decode(&n.encode()).unwrap(), n);
         let f = GroupMessage::FetchRequest {
-            sender: "abc".into(),
+            sender: PeerId::from_bytes([3u8; 32]),
             seq: 9,
         };
         assert_eq!(GroupMessage::decode(&f.encode()).unwrap(), f);
@@ -3878,7 +4035,7 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
         let (roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let hub = GroupHub::with_config(
             &alice,
             roster,
@@ -3908,7 +4065,7 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
         let (roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let hub = GroupHub::with_config(
             &alice,
             roster,
@@ -3941,7 +4098,7 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
         let (roster, genesis) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let store = Arc::new(crate::storage::MemoryEventStore::new());
         let cfg = || GroupHubConfig {
             auto_pump: false,
@@ -4001,11 +4158,11 @@ mod tests {
     #[test]
     fn receipt_wire_round_trips() {
         let r = GroupMessage::Receipt {
-            author: "a".into(),
+            author: PeerId::from_bytes([4u8; 32]),
             seq: 4,
             content_hash: [9; 32],
             kind: ReceiptKind::Read,
-            receiver: "b".into(),
+            receiver: PeerId::from_bytes([5u8; 32]),
             signature: [7; 64],
         };
         assert_eq!(GroupMessage::decode(&r.encode()).unwrap(), r);
@@ -4020,7 +4177,7 @@ mod tests {
         let bob = Identity::generate();
         let mallory = Identity::generate();
         let (roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let hub = GroupHub::with_config(
             &alice,
             roster,
@@ -4077,7 +4234,7 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
         let (roster, genesis) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let store = Arc::new(crate::storage::MemoryEventStore::new());
         let cfg = || GroupHubConfig {
             auto_pump: false,
@@ -4124,7 +4281,7 @@ mod tests {
 
     /// Build the header bytes the chain hashes, for author "x" (tests only).
     fn hdr(seq: u64, prev: &[u8; 32], rv: u64, content: &[u8]) -> Vec<u8> {
-        GroupMessage::header_bytes("x", seq, prev, rv, content)
+        GroupMessage::header_bytes(&PeerId::from_bytes([b'x'; 32]), seq, prev, rv, content)
     }
 
     #[test]
@@ -4135,7 +4292,7 @@ mod tests {
             payload: b"hello".to_vec(),
         }
         .encode();
-        let (s1, p1) = own.next_header("x", 0, &c1);
+        let (s1, p1) = own.next_header(&PeerId::from_bytes([b'x'; 32]), 0, &c1);
         assert!(chain
             .verify_and_advance(s1, p1, 0, &hdr(s1, &p1, 0, &c1))
             .is_ok());
@@ -4143,7 +4300,7 @@ mod tests {
             payload: b"world".to_vec(),
         }
         .encode();
-        let (s2, p2) = own.next_header("x", 0, &c2);
+        let (s2, p2) = own.next_header(&PeerId::from_bytes([b'x'; 32]), 0, &c2);
         assert!(chain
             .verify_and_advance(s2, p2, 0, &hdr(s2, &p2, 0, &c2))
             .is_ok());
@@ -4156,12 +4313,12 @@ mod tests {
             payload: b"hello".to_vec(),
         }
         .encode();
-        let (_s1, _p1) = own.next_header("x", 0, &c1);
+        let (_s1, _p1) = own.next_header(&PeerId::from_bytes([b'x'; 32]), 0, &c1);
         let c2 = GroupContent::Post {
             payload: b"world".to_vec(),
         }
         .encode();
-        let (s2, p2) = own.next_header("x", 0, &c2);
+        let (s2, p2) = own.next_header(&PeerId::from_bytes([b'x'; 32]), 0, &c2);
 
         let mut chain = SenderChainState::new();
         assert!(chain
@@ -4183,12 +4340,12 @@ mod tests {
             payload: b"a".to_vec(),
         }
         .encode();
-        let (s1, p1) = own.next_header("x", 5, &c);
+        let (s1, p1) = own.next_header(&PeerId::from_bytes([b'x'; 32]), 5, &c);
         assert!(chain
             .verify_and_advance(s1, p1, 5, &hdr(s1, &p1, 5, &c))
             .is_ok());
         // Claiming an OLDER roster version later in the chain is backdating.
-        let (s2, p2) = own.next_header("x", 3, &c);
+        let (s2, p2) = own.next_header(&PeerId::from_bytes([b'x'; 32]), 3, &c);
         assert!(chain
             .verify_and_advance(s2, p2, 3, &hdr(s2, &p2, 3, &c))
             .is_err());
@@ -4201,7 +4358,7 @@ mod tests {
             payload: b"meeting is at 5pm".to_vec(),
         }
         .encode();
-        let (seq1, prev1) = own.next_header("x", 0, &c1);
+        let (seq1, prev1) = own.next_header(&PeerId::from_bytes([b'x'; 32]), 0, &c1);
 
         let mut alice_view = SenderChainState::new();
         let mut bob_view = SenderChainState::new();
@@ -4250,7 +4407,7 @@ mod tests {
         let (mut roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
         let bob_id = bob.fingerprint();
         // v0: bob is a writer. v1: bob is removed.
-        let remove = roster.propose_remove(&alice, bob_id.clone()).unwrap();
+        let remove = roster.propose_remove(&alice, bob_id).unwrap();
         roster.apply(&remove).unwrap();
 
         assert!(
@@ -4301,7 +4458,7 @@ mod tests {
         let signature = x.sign(&signing_bytes).to_bytes();
 
         let wire = GroupMessage::Application {
-            sender: sender.clone(),
+            sender,
             seq,
             prev_hash,
             roster_version: 0,
@@ -4370,7 +4527,7 @@ mod tests {
     /// Build the wire bytes for a signed post, exactly as an author's hub would.
     fn signed_post(
         author: &Identity,
-        group_id: &str,
+        group_id: &GroupId,
         seq: u64,
         prev: [u8; 32],
         rv: u64,
@@ -4413,7 +4570,7 @@ mod tests {
         let bob = Identity::generate();
         let outsider = Identity::generate();
         let (roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let tr = crate::trace::CollectingTracer::new();
         let hub = GroupHub::with_config(
             &alice,
@@ -4451,11 +4608,76 @@ mod tests {
     }
 
     #[test]
+    fn an_identical_second_copy_is_ignored_as_a_duplicate_not_rejected() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let (roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
+        let gid = roster.group_id;
+        let tr = crate::trace::CollectingTracer::new();
+        let hub = GroupHub::with_config(
+            &alice,
+            roster,
+            GroupHubConfig {
+                auto_pump: false,
+                tracer: tr.clone(),
+                ..Default::default()
+            },
+        );
+        let wire = signed_post(&bob, &gid, 1, [0u8; 32], 0, b"once");
+        hub.process_one(bob.fingerprint(), wire.clone());
+        hub.process_one(alice.fingerprint(), wire); // same bytes, other path
+        assert!(tr.any(|e| matches!(e, TraceEvent::GroupMessageDuplicate { seq: 1, .. })));
+        assert!(!tr.any(|e| matches!(e, TraceEvent::GroupMessageRejected { .. })));
+        assert_eq!(hub.history_for(&bob.fingerprint()).len(), 1);
+    }
+
+    #[test]
+    fn different_content_under_an_already_held_number_is_rejected_as_a_conflict() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let (roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
+        let gid = roster.group_id;
+        let tr = crate::trace::CollectingTracer::new();
+        let hub = GroupHub::with_config(
+            &alice,
+            roster,
+            GroupHubConfig {
+                auto_pump: false,
+                tracer: tr.clone(),
+                ..Default::default()
+            },
+        );
+        // Bob signs TWO different messages as his #1 (equivocation).
+        hub.process_one(
+            bob.fingerprint(),
+            signed_post(&bob, &gid, 1, [0u8; 32], 0, b"version A"),
+        );
+        hub.process_one(
+            bob.fingerprint(),
+            signed_post(&bob, &gid, 1, [0u8; 32], 0, b"version B"),
+        );
+        assert!(tr.any(|e| matches!(
+            e,
+            TraceEvent::GroupMessageRejected {
+                reason: "conflicting content for an already-held sequence number",
+                ..
+            }
+        )));
+        assert!(!tr.any(|e| matches!(e, TraceEvent::GroupMessageDuplicate { .. })));
+        let h = hub.history_for(&bob.fingerprint());
+        assert_eq!(h.len(), 1);
+        assert_eq!(
+            h[0].1, b"version A",
+            "the first one held must not be replaced"
+        );
+    }
+
+    #[test]
     fn a_message_signed_before_the_authors_removal_is_still_accepted_afterwards() {
         let alice = Identity::generate();
         let bob = Identity::generate();
         let (roster, genesis) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let hub = manual_hub(&alice, roster);
         hub.propose_remove(&alice, bob.fingerprint()).unwrap(); // hub is now at v1
 
@@ -4474,7 +4696,7 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
         let (roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let hub = manual_hub(&alice, roster);
         hub.propose_remove(&alice, bob.fingerprint()).unwrap(); // v1
 
@@ -4489,7 +4711,7 @@ mod tests {
         let bob = Identity::generate();
         let carol = Identity::generate();
         let (mut roster_a, genesis) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster_a.group_id.clone();
+        let gid = roster_a.group_id;
         // Our hub knows only genesis (v0); alice has since added carol (v1).
         let hub = manual_hub(&alice, Roster::from_genesis(&genesis).unwrap());
         let add = roster_a
@@ -4524,7 +4746,7 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
         let (roster, _g) = Roster::genesis_default(&alice, vec![bob.public_key()]);
-        let gid = roster.group_id.clone();
+        let gid = roster.group_id;
         let hub = manual_hub(&alice, roster);
         for i in 0..(MAX_DEFERRED as u64 + 50) {
             hub.process_one(

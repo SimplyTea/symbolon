@@ -135,6 +135,9 @@ fn session_config() -> SessionConfig {
         if let Some(d) = t.dead_after {
             c.dead_after = d;
         }
+        if let Some(p) = t.padding {
+            c.padding = p;
+        }
     }
     c
 }
@@ -147,6 +150,8 @@ struct Timing {
     heartbeat: Option<Option<Duration>>,
     dead_after: Option<Duration>,
     connect: Option<Duration>,
+    /// `--padding`: how outgoing messages are padded (None = library default, off).
+    padding: Option<symbolon::padding::Padding>,
 }
 static TIMING: std::sync::OnceLock<Timing> = std::sync::OnceLock::new();
 
@@ -161,22 +166,48 @@ fn init_timing(args: &[String]) {
                 .unwrap_or_else(|_| die(&format!("{name} takes a whole number of seconds")))
         })
     };
-    let off_if_zero = |n: u64| if n == 0 { None } else { Some(Duration::from_secs(n)) };
-    let mut t = Timing::default();
-    t.handshake = secs("--handshake-timeout").map(off_if_zero);
-    t.heartbeat = secs("--heartbeat").map(off_if_zero);
-    t.dead_after = secs("--dead-after").map(|n| {
+    let off_if_zero = |n: u64| {
+        if n == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(n))
+        }
+    };
+    let handshake = secs("--handshake-timeout").map(off_if_zero);
+    let heartbeat = secs("--heartbeat").map(off_if_zero);
+    let dead_after = secs("--dead-after").map(|n| {
         if n == 0 {
             die("--dead-after must be above 0 (use --heartbeat 0 to turn liveness checks off)")
         }
         Duration::from_secs(n)
     });
-    t.connect = secs("--connect-timeout").map(|n| {
+    let connect = secs("--connect-timeout").map(|n| {
         if n == 0 {
             die("--connect-timeout must be above 0")
         }
         Duration::from_secs(n)
     });
+    // `--padding off|standard|strong|BYTES`: pad what we send up to a multiple of
+    // a block size (see the library's `padding` module). Default off.
+    let padding = flag(args, "--padding").map(|v| match v.as_str() {
+        "off" => symbolon::padding::Padding::OFF,
+        "standard" => symbolon::padding::Padding::STANDARD,
+        "strong" => symbolon::padding::Padding::STRONG,
+        n => n
+            .parse::<u16>()
+            .ok()
+            .and_then(|b| symbolon::padding::Padding::block(b).ok())
+            .unwrap_or_else(|| {
+                die("--padding takes off, standard (256), strong (1024) or a block size of 16 to 65535 bytes")
+            }),
+    });
+    let t = Timing {
+        handshake,
+        heartbeat,
+        dead_after,
+        connect,
+        padding,
+    };
     let defaults = SessionConfig::default();
     let hb = t.heartbeat.unwrap_or(defaults.heartbeat_interval);
     let dead = t.dead_after.unwrap_or(defaults.dead_after);
@@ -368,6 +399,8 @@ FLAGS:
   --handshake-timeout S  give up on a handshake after S seconds (default 10; 0 = wait forever)
   --connect-timeout S    give up dialling after S seconds (default 10)
   --relay-cache N (group-run, bot-run) messages kept per sender to help others catch up (default 256)
+  --padding P   pad what you SEND to hide message length: off (default), standard (256-byte blocks),
+                strong (1024) or a block size 16..65535. The other side needs no matching setting
   --no-reconnect  exit when the connection ends instead of reconnecting
   --members K,K create group with these OTHER members' public keys (group-new)
   --invite HEX  the creator's invite (first group-run); needs --trust CREATOR_KEY
@@ -572,7 +605,7 @@ fn main() {
 /// A security tool must not quietly drop something like a mistyped
 /// `--bind`: you could end up listening somewhere other than you intended.
 fn reject_unknown_arguments(args: &[String]) {
-    const WITH_VALUE: [&str; 22] = [
+    const WITH_VALUE: [&str; 23] = [
         "--id",
         "--trust",
         "--bind",
@@ -595,6 +628,7 @@ fn reject_unknown_arguments(args: &[String]) {
         "--handshake-timeout",
         "--connect-timeout",
         "--relay-cache",
+        "--padding",
     ];
     const SWITCHES: [&str; 8] = [
         "--debug",
@@ -640,7 +674,7 @@ fn bot_new(args: &[String]) {
     let Some(path) = flag(args, "--id") else {
         die("bot-new needs --id FILE (a separate file from your own identity)");
     };
-    if PathBuf::from(&path) == default_id_path() {
+    if default_id_path() == std::path::Path::new(&path) {
         die("that is your personal identity file; give the bot its own --id FILE");
     }
     let id = keygen_inner(args);
@@ -831,8 +865,7 @@ fn run(args: &[String], listening: bool) {
         let addr = flag(args, "--addr").unwrap_or_else(|| die("--addr host:port is required"));
         dlog!("net", "connecting to {addr} ...");
         let t = Instant::now();
-        let s = dial(&addr)
-            .unwrap_or_else(|e| die(&format!("cannot connect to {addr}: {e}")));
+        let s = dial(&addr).unwrap_or_else(|e| die(&format!("cannot connect to {addr}: {e}")));
         keep_addr = Some(addr.clone());
         dlog!(
             "net",
@@ -1038,7 +1071,7 @@ fn run(args: &[String], listening: bool) {
         let Ok(line) = line else { break };
         let session = current.lock().unwrap().clone();
         if line.starts_with("//") {
-            if !send_traced(&session, line[1..].as_bytes(), &stats, &last_pub) {
+            if !send_traced(&session, &line.as_bytes()[1..], &stats, &last_pub) {
                 break;
             }
         } else if line.starts_with('/') {

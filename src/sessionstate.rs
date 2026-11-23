@@ -59,7 +59,7 @@ use crate::reliability::{Inbox, Outbox};
 use crate::storage::{open, seal, StateStore};
 
 const MAGIC: &[u8; 4] = b"SYMS";
-const FORMAT: u8 = 1;
+const FORMAT: u8 = 2; // 2: the peer id is 32 raw bytes (was a length-prefixed hex string)
 /// Sanity cap on queued-undelivered messages in a state file.
 const MAX_PENDING: usize = 100_000;
 
@@ -106,7 +106,7 @@ impl SessionPersistence {
         let mut guard = OWNERS.lock().unwrap();
         let g = guard
             .get_or_insert_with(Default::default)
-            .entry((self.store_id(), peer.clone()))
+            .entry((self.store_id(), *peer))
             .or_insert(0);
         *g += 1;
         *g
@@ -117,7 +117,7 @@ impl SessionPersistence {
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|m| m.get(&(self.store_id(), peer.clone())))
+            .and_then(|m| m.get(&(self.store_id(), *peer)))
             == Some(&ticket)
     }
 
@@ -202,7 +202,7 @@ impl SavedState {
         if c.take(4)? != MAGIC || c.take(1)?[0] != FORMAT {
             return Err(BAD);
         }
-        let peer_id = String::from_utf8(c.blob()?.to_vec()).map_err(|_| BAD)?;
+        let peer_id = PeerId::from_bytes(c.take(32)?.try_into().unwrap());
         let own_epoch: [u8; 16] = c.take(16)?.try_into().unwrap();
         let peer_epoch: [u8; 16] = c.take(16)?.try_into().unwrap();
         let ratchet = Ratchet::from_bytes(c.blob()?)?;
@@ -296,7 +296,7 @@ impl StateSaver {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.push(FORMAT);
-        put_blob(&mut out, self.peer_id.as_bytes());
+        out.extend_from_slice(self.peer_id.as_bytes());
         out.extend_from_slice(&self.own_epoch);
         out.extend_from_slice(&self.peer_epoch);
         put_blob(&mut out, &r.to_bytes());

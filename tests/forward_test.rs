@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use symbolon::group::{
     GroupHub, GroupHubConfig, GroupKind, GroupMessage, Permissions, RelayPolicy, Roster,
 };
-use symbolon::identity::Identity;
+use symbolon::identity::{Identity, PeerId};
 use symbolon::peer::PeerRegistry;
 use symbolon::session::{Role, Session, SessionConfig};
 use symbolon::trace::{CollectingTracer, TraceEvent};
@@ -115,7 +115,7 @@ fn group(n: usize, policy: RelayPolicy, tier_of: impl Fn(usize) -> &'static str)
     Group { ids, hubs }
 }
 
-fn fp(g: &Group, i: usize) -> String {
+fn fp(g: &Group, i: usize) -> PeerId {
     g.ids[i].fingerprint()
 }
 
@@ -176,7 +176,7 @@ fn it_spreads_across_several_hops_and_stops() {
 }
 
 #[test]
-fn full_mesh_causes_no_duplicate_deliveries_or_rejections() {
+fn full_mesh_duplicates_are_dropped_quietly_never_rejected() {
     // Everyone linked to everyone: nobody should need a forward, and the
     // announcements must not turn into repeated copies.
     let tracer = CollectingTracer::new();
@@ -226,11 +226,12 @@ fn full_mesh_causes_no_duplicate_deliveries_or_rejections() {
     thread::sleep(Duration::from_millis(500)); // let any stray copies land
     assert!(
         !tracer.any(|e| matches!(e, TraceEvent::GroupMessageRejected { .. })),
-        "a full mesh must not produce duplicate/rejected copies: {:?}",
+        "a duplicate copy must be ignored, never reported as a rejection: {:?}",
         tracer.events()
     );
-    for i in 1..4 {
-        assert_eq!(hubs[i].history_for(&ids[0].fingerprint()).len(), 5);
+    // Each message is held exactly once per member, however many copies arrived.
+    for hub in &hubs[1..4] {
+        assert_eq!(hub.history_for(&ids[0].fingerprint()).len(), 5);
     }
 }
 
@@ -378,7 +379,7 @@ fn announcements_naming_strangers_or_ourselves_are_ignored() {
         let (a, b) = session_pair(&g.ids[1], &outsider);
         (a, (b, outsider))
     };
-    g.hubs[1].attach_session("outsider-fp".to_string(), Arc::new(bob_side));
+    g.hubs[1].attach_session(PeerId::from_bytes([0xEE; 32]), Arc::new(bob_side));
     let (raw, _o) = carol_raw;
     let _ = drain(&raw, Duration::from_millis(100));
     raw.send(

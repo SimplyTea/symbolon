@@ -8,6 +8,7 @@
 //!   * the MINOR version (only if [`Disclose::Minor`] or [`Disclose::Full`]),
 //!   * the PATCH version (only if [`Disclose::Full`]),
 //!   * the TCP port to dial.
+//!
 //! It never contains your public key, fingerprint, group names or anything
 //! else: a stable identifier on the wire would let anyone on the network
 //! track you across places (see NOTES.md, "handshake oracle"). To connect to
@@ -194,7 +195,7 @@ impl Announcer {
             let mut last: Option<Duration> = None;
             while !stop2.load(Ordering::SeqCst) {
                 let now = clock.now();
-                if last.map_or(true, |l| now.saturating_sub(l) >= interval) {
+                if last.is_none_or(|l| now.saturating_sub(l) >= interval) {
                     let _ = sock.send_to(&packet, target); // best effort: a missed beacon is harmless
                     last = Some(now);
                 }

@@ -24,21 +24,13 @@ use rand_core::OsRng;
 
 use crate::error::{ChatError, Result};
 
-/// A stable, human-showable identifier for a peer: the SHA-256 fingerprint
-/// of their long-term public key, hex-encoded. This is what you'd read
-/// aloud / compare on a QR code to verify you're pinning the right key.
-pub type PeerId = String;
+pub use crate::ids::PeerId;
 
-/// Derive the [`PeerId`] fingerprint for a given Ed25519 public key.
+/// Derive the [`PeerId`] fingerprint for a given Ed25519 public key: the
+/// SHA-256 hash of the 32 key bytes.
 pub fn fingerprint(public_key: &VerifyingKey) -> PeerId {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(public_key.as_bytes());
-    // Hex-encode manually so we don't need to pull in a `hex` crate.
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    PeerId::from_bytes(Sha256::digest(public_key.as_bytes()).into())
 }
 
 /// Our own long-term identity: a signing keypair that proves "I am me"

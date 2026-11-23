@@ -100,6 +100,12 @@ pub enum ChatError {
     /// already-consumed message key, too many skipped messages, a degenerate
     /// (low-order) DH key, or an AEAD failure. The payload says which.
     Ratchet(&'static str),
+    /// A setting passed to the library is not valid (for example a padding
+    /// block size that is too small). The payload says which.
+    InvalidConfig(&'static str),
+    /// A file transfer step failed a check (bad chunk, manifest that does not
+    /// match the offer, file too large, ...). The payload says which.
+    FileTransfer(&'static str),
 }
 
 impl fmt::Display for ChatError {
@@ -125,6 +131,8 @@ impl fmt::Display for ChatError {
             ChatError::ConnectionClosed => write!(f, "connection closed unexpectedly"),
             ChatError::Io(e) => write!(f, "I/O error: {e}"),
             ChatError::MalformedMessage(reason) => write!(f, "malformed message: {reason}"),
+            ChatError::InvalidConfig(reason) => write!(f, "invalid setting: {reason}"),
+            ChatError::FileTransfer(reason) => write!(f, "file transfer: {reason}"),
             ChatError::UnsupportedVersion => write!(f, "unsupported protocol version"),
             ChatError::VersionMismatch { ours, theirs } => write!(
                 f,
